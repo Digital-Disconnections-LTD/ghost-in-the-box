@@ -1,0 +1,1 @@
+"""Source-linked brief generation."""

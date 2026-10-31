@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh Instagram ghost-in-the-box inbox for %i every 15 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/15:00 UTC
+Persistent=true
+Unit=ghost-in-the-box-ig-inbox@%i.service
+
+[Install]
+WantedBy=timers.target

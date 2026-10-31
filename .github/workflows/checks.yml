@@ -1,0 +1,32 @@
+name: Garden checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        python: ['3.11', '3.14']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install development tools
+        run: python -m pip install -e '.[dev]'
+      - name: Offline regression tests
+        run: python -m unittest discover -s tests -v
+      - name: Build the distribution
+        run: python -m build
+      - name: Command-line smoke
+        run: |
+          ghost-in-the-box --help
+          ghost-in-the-box doctor
+          ghost-in-the-box instagram-mcp --list-tools

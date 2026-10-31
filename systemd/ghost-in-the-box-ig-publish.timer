@@ -1,0 +1,10 @@
+[Unit]
+Description=Check Instagram ghost-in-the-box outbox every two minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/2:00 UTC
+Persistent=true
+Unit=ghost-in-the-box-ig-publish.service
+
+[Install]
+WantedBy=timers.target

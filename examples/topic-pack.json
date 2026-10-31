@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "title": "Tools you can own",
+  "why": ["A local example for exploring the brief and draft workflow."],
+  "angle": ["Useful tools should leave people in control of their work."],
+  "hooks": ["What would you build if your tools were yours?"],
+  "sources": [{"label": "Our mission", "url": "https://digitaldisconnections.com/our-story.html"}],
+  "lanes": ["threads", "instagram"],
+  "voice": ["Curious, warm, and specific. Invite a real conversation."],
+  "drafts": {
+    "threads": "What would you build if your tools were yours? We are growing a garden of independent software. Bring a small idea, a useful fix, or a question worth asking.",
+    "instagram": "Good tools make room for people. What would you like to grow next?"
+  }
+}

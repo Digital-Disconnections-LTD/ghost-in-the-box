@@ -1,0 +1,27 @@
+name: A gremlin in the garden
+description: Help us reproduce and fix a bug.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping! Please remove credentials, account sessions, and private messages from logs.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How can we reproduce it?
+      description: Small examples using fake accounts are ideal.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Your environment
+      description: OS, Python version, project revision, and relevant optional helper versions.
+    validations:
+      required: true

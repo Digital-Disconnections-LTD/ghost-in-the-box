@@ -1,0 +1,24 @@
+name: Plant an idea
+description: Propose an improvement or a new connection.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would this help you do?
+      description: Tell us about the workflow you want to improve.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would a good result look like?
+      description: Examples, alternatives, and small first steps are welcome.
+    validations:
+      required: true
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Want to help grow it?
+      options:
+        - label: I would like to help with implementation, testing, documentation, or artwork.

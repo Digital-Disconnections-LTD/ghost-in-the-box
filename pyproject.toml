@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghost-in-the-box"
+version = "0.1.0"
+description = "Local social tools for your accounts, your voice, and conversations with receipts."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "docs/third-party-licenses/*.txt"]
+authors = [{name = "Digital Disconnections"}]
+dependencies = ["requests>=2.31"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX",
+]
+
+[project.optional-dependencies]
+instagram = ["instagrapi==2.18.20", "Pillow>=10"]
+media = ["Pillow>=10"]
+browser = ["scrapling[fetchers]>=0.3"]
+substack = ["python-substack[mcp]>=0.10,<0.11"]
+dev = ["Pillow>=10", "instagrapi==2.18.20", "build>=1"]
+
+[project.scripts]
+ghost-in-the-box = "farm.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Digital-Disconnections-LTD/ghost-in-the-box"
+Documentation = "https://github.com/Digital-Disconnections-LTD/ghost-in-the-box/tree/main/docs"
+Issues = "https://github.com/Digital-Disconnections-LTD/ghost-in-the-box/issues"
+Mission = "https://digitaldisconnections.com/our-story.html"
+
+[tool.setuptools.packages.find]
+include = ["farm*", "scripts*", "buzz*"]
+
+[tool.setuptools.package-data]
+scripts = ["*.mjs"]

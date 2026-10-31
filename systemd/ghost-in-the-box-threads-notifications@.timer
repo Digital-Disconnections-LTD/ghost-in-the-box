@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh Threads reply notifications for %i at varied intervals
+
+[Timer]
+OnActiveSec=2min
+OnUnitInactiveSec=12min
+RandomizedDelaySec=8min
+FixedRandomDelay=no
+AccuracySec=1s
+Unit=ghost-in-the-box-threads-notifications@%i.service
+
+[Install]
+WantedBy=timers.target

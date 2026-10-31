@@ -1,0 +1,7 @@
+{
+  "account": "example_creator",
+  "publication_url": "https://YOUR-PUBLICATION.substack.com",
+  "cookies_path": "/absolute/private/substack-cookies.json",
+  "timezone": "UTC",
+  "ready": false
+}

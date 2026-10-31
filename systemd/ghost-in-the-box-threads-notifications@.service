@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh Threads reply notifications for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/ghost-in-the-box
+ExecStart=%h/ghost-in-the-box/.venv/bin/python %h/ghost-in-the-box/scripts/threads_notifications.py --account %i sync --posts 3 --replies-per-post 25
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=-%h/.config/ghost-in-the-box/runtime.env
+TimeoutStartSec=3min
+UMask=0077

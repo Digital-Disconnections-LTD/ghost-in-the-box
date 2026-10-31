@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh own Instagram caption corpus for ghost-in-the-box account %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/ghost-in-the-box
+ExecStart=%h/ghost-in-the-box/.venv/bin/python %h/ghost-in-the-box/scripts/ig_import_own.py import --username %i --pages 1 --page-size 12 --deadline 120
+Environment=PYTHONDONTWRITEBYTECODE=1
+TimeoutStartSec=3min
+UMask=0077
