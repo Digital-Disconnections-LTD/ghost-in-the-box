@@ -60,7 +60,7 @@ then use the same `ghost-in-the-box` command for accounts, briefs, inboxes, and 
 Linux and macOS use POSIX file locks; Windows users need a Linux environment such
 as WSL.
 
-## Bring a Bat, or your favorite MCP client 🦉
+## Bring a Bat, or your favorite MCP client 👻
 
 Ghost in the Box works alongside [Batbox](https://github.com/Digital-Disconnections-LTD/batbox)
 and other MCP clients. Instagram tools speak framed or newline JSON over stdio;
