@@ -5,9 +5,10 @@ from pathlib import Path
 from types import SimpleNamespace as S
 from farm.inbox import Inbox, sync_comments
 from farm.outbox import Outbox
+from _env import IsolatedStateTestCase
 
 
-class InboxTests(unittest.TestCase):
+class InboxTests(IsolatedStateTestCase):
     def test_dedup_sources_draft_and_cursor(self):
         with tempfile.TemporaryDirectory() as tmp:
             inbox = Inbox(Path(tmp)/'inbox.sqlite3')
@@ -106,6 +107,47 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(set(client.scanned),{post.id for post in posts})
             self.assertEqual(inbox.cursor('owner','own-posts-backfill'),'after-33')
             inbox.close()
+
+class MarkSeenTests(IsolatedStateTestCase):
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.inbox = Inbox(Path(self.tmp.name)/'inbox.sqlite3')
+        self.addCleanup(self.inbox.close)
+        stamp = datetime.now(timezone.utc)
+        for pk in (1,2,3,4,5):
+            self.inbox.save_comment('owner','1_7','ABC',
+                S(pk=pk,created_at_utc=stamp,user=S(username='reader'),text=f'comment {pk}'))
+
+    def state(self, comment_id):
+        row = self.inbox.db.execute('SELECT response_state,claimed_by FROM comments WHERE comment_id=?',
+                                    (comment_id,)).fetchone()
+        return tuple(row)
+
+    def test_marks_unreviewed_and_expired_reviews_only(self):
+        self.assertTrue(self.inbox.mark_seen('owner','1'))
+        self.assertEqual(self.state('1'),('reviewing','operator'))
+        held = self.inbox.unseen('owner',limit=1,worker='mnemo')[0]['comment_id']
+        self.assertFalse(self.inbox.mark_seen('owner',held))
+        self.assertEqual(self.state(held),('reviewing','mnemo'))
+        self.inbox.db.execute("UPDATE comments SET claim_until='2000-01-01T00:00:00+00:00' WHERE comment_id=?",
+                              (held,))
+        self.assertTrue(self.inbox.mark_seen('owner',held))
+        self.assertEqual(self.state(held),('reviewing','operator'))
+
+    def test_never_resurrects_skipped_or_detaches_drafted_comments(self):
+        self.inbox.skip('owner','4')
+        with Outbox(Path(self.tmp.name)/'outbox.sqlite3') as outbox:
+            job = self.inbox.draft_reply(outbox,'owner','5','A reply')
+        self.assertFalse(self.inbox.mark_seen('owner','4'))
+        self.assertFalse(self.inbox.mark_seen('owner','5'))
+        self.assertEqual(self.state('4')[0],'skipped')
+        self.assertEqual(self.state('5')[0],'drafted')
+        row = self.inbox.db.execute('SELECT draft_job_id FROM comments WHERE comment_id=?',('5',)).fetchone()
+        self.assertEqual(row[0],job['id'])
+        self.assertFalse(self.inbox.mark_seen('owner','missing'))
+
 
 if __name__ == '__main__':
     unittest.main()

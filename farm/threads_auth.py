@@ -7,28 +7,33 @@ instagrapi; provider bodies, exceptions, and secrets never leave this module.
 
 from __future__ import annotations
 
-from farm.config import STATE_ROOT
+from farm.config import credentials_path, instagram_sessions_dir, threads_auth_dir
+from farm.session_files import is_private, protect_descriptor
 
 
 
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import fcntl
+from farm import locking as fcntl
 import json
 import logging
 import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 import tempfile
-DEFAULT_CREDS = Path.home() / ".batbox/social-farm-creds/ig.json"
-DEFAULT_IG_DIR = STATE_ROOT / 'ig'
-DEFAULT_AUTH_DIR = STATE_ROOT / 'threads-auth'
+DEFAULT_CREDS = credentials_path()
+DEFAULT_IG_DIR = instagram_sessions_dir()
+DEFAULT_AUTH_DIR = threads_auth_dir()
 INSTAGRAM_TOKEN_SOURCE = "instagram_session"
 THREADS_TOKEN_SOURCE = "threads_bloks"
 _ACCOUNT = re.compile(r"[A-Za-z0-9._]+\Z")
 _DEVICE = re.compile(r"android-[0-9a-fA-F]{13,32}\Z")
 _TOKEN = re.compile(r"Bearer (IGT:2:[A-Za-z0-9:_~+./=-]{24,})\Z")
+IDENTITY_URL = "https://i.instagram.com/api/v1/accounts/current_user/"
+THREADS_APP_ID = "238260118697367"
 
 
 class ThreadsAuthError(Exception):
@@ -66,7 +71,28 @@ class ThreadsToken:
 
 
 def _private_file(path: Path) -> bool:
-    return path.is_file() and not path.is_symlink() and path.stat().st_mode & 0o077 == 0
+    return path.is_file() and not path.is_symlink() and is_private(path)
+
+
+def _restrict(fd: int, path: str) -> None:
+    """Make a new secret file owner-only on POSIX and on native Windows."""
+    try:
+        protect_descriptor(fd, Path(path))
+    except subprocess.CalledProcessError as exc:
+        raise OSError("owner-only access could not be applied") from exc
+
+
+def read_verification_code(*, stdin=None, prompt: str = "Current authenticator code: ") -> str:
+    """Read one 6 or 8 digit code; hidden on a terminal, one line from a pipe."""
+    stream = stdin or sys.stdin
+    if stream.isatty():
+        import getpass
+        code = getpass.getpass(prompt, stream=sys.stderr).strip()
+    else:
+        code = stream.readline().strip()
+    if not code.isascii() or not code.isdecimal() or len(code) not in (6, 8):
+        raise ThreadsAuthError("invalid_code_format", needs_code=True)
+    return code
 
 
 def load_inputs(creds_path: Path = DEFAULT_CREDS,
@@ -213,7 +239,7 @@ def _save_ig_settings(settings: dict, destination: Path) -> None:
         fd, temporary = tempfile.mkstemp(prefix=".ig-session-", dir=destination.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                os.fchmod(handle.fileno(), 0o600)
+                _restrict(handle.fileno(), temporary)
                 json.dump(settings, handle, separators=(",", ":"))
                 handle.write("\n")
                 handle.flush()
@@ -249,7 +275,7 @@ def save_token(token: ThreadsToken, auth_dir: Path = DEFAULT_AUTH_DIR) -> Path:
         fd, temporary = tempfile.mkstemp(prefix=".threads-auth-", dir=auth_dir)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                os.fchmod(handle.fileno(), 0o600)
+                _restrict(handle.fileno(), temporary)
                 json.dump(token.as_dict(), handle, separators=(",", ":"))
                 handle.write("\n")
                 handle.flush()
@@ -282,3 +308,46 @@ def load_token(username: str, auth_dir: Path = DEFAULT_AUTH_DIR) -> ThreadsToken
         return token
     except (OSError, TypeError, KeyError, ValueError):
         raise ThreadsAuthError("local_token_invalid") from None
+
+
+def verify_bearer_identity(token: ThreadsToken, *, http, headers: dict | None = None,
+                           timeout: float = 15) -> dict:
+    """Ask the server who the bearer belongs to; fail unless it is the token's account.
+
+    Uses the same current_user endpoint instagrapi's account_info calls, on the
+    host the mobile publisher writes to. Provider bodies never leave here.
+    """
+    request_headers = {
+        "User-Agent": "Barcelona 289.0.0.77.109 Android", "Accept": "*/*",
+        "X-IG-App-ID": THREADS_APP_ID, "X-IG-Capabilities": "3brTvx0=",
+        "X-IG-Connection-Type": "WIFI", **(headers or {}),
+    }
+    # Always check the bearer named by the token, whatever headers came in.
+    request_headers["Authorization"] = "Bearer " + token.token
+    try:
+        response = http.get(IDENTITY_URL, params={"edit": "true"}, headers=request_headers,
+                            timeout=timeout, allow_redirects=False)
+    except Exception:
+        raise ThreadsAuthError("identity_unavailable") from None
+    if response.status_code in (401, 403):
+        raise ThreadsAuthError("bearer_rejected")
+    if response.status_code == 429:
+        raise ThreadsAuthError("rate_limited")
+    if response.status_code != 200:
+        raise ThreadsAuthError("identity_unavailable")
+    try:
+        data = response.json()
+    except ValueError:
+        raise ThreadsAuthError("identity_unavailable") from None
+    if isinstance(data, dict) and data.get("message") == "login_required":
+        raise ThreadsAuthError("bearer_rejected")
+    user = data.get("user") if isinstance(data, dict) else None
+    if not isinstance(user, dict):
+        raise ThreadsAuthError("identity_unavailable")
+    username = str(user.get("username") or "")
+    user_id = str(user.get("pk") or user.get("pk_id") or user.get("strong_id__") or "")
+    if not username or not user_id.isdecimal():
+        raise ThreadsAuthError("identity_unavailable")
+    if username.casefold() != token.username.casefold() or user_id != token.user_id:
+        raise ThreadsAuthError("identity_mismatch")
+    return {"id": user_id, "username": username}

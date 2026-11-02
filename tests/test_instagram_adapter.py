@@ -4,17 +4,38 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import importlib.util
+
+import farm.adapters as shared
 from farm.accounts import AccountRegistry
-from farm.adapters.instagram import InstagramAdapter, PreSendFailure, PublishUncertain
+from farm.config import install_command
+from farm.adapters.instagram import (
+    AuthUnavailable, DependencyUnavailable, InstagramAdapter, PreSendFailure, PublishRejected,
+    PublishUncertain,
+)
 from farm.outbox import Outbox
 from scripts.instagram_carousel import create_draft as create_carousel_draft
+from _env import IsolatedStateTestCase
+
+
+class ProviderError(Exception):
+    pass
 
 
 class FakeClient:
-    def __init__(self, *, account="mine", send_error=False):
+    """Mimics the instagrapi 2.18.20 members the adapter relies on."""
+
+    session_retry_total = 3
+    private_requests_count = 0
+
+    def __init__(self, *, account="mine", send_error=None):
         self.account = account
+        # True or "timeout": no answer. An int: that HTTP status.
         self.send_error = send_error
         self.calls = []
+        self.writes = []
+        self.retry_total_at_configure = None
+        self.last_response = None
 
     def load_settings(self, path):
         self.calls.append(("load_settings", str(path)))
@@ -23,21 +44,36 @@ class FakeClient:
         self.calls.append(("account_info",))
         return SimpleNamespace(username=self.account)
 
+    def _configure_private_session_retry(self):
+        self.retry_total_at_configure = self.session_retry_total
+
+    def _send_private_request(self, endpoint, data=None, **kwargs):
+        self.last_response = None
+        self.writes.append(endpoint)
+        if self.send_error in (True, "timeout"):
+            raise TimeoutError("ambiguous provider response")
+        if isinstance(self.send_error, int):
+            self.last_response = SimpleNamespace(status_code=self.send_error)
+            raise ProviderError(f"HTTP {self.send_error}")
+        return {"status": "ok"}
+
+    def private_request(self, endpoint, data=None, **kwargs):
+        return self._send_private_request(endpoint, data=data, **kwargs)
+
     def media_comment(self, media_id, text, replied_to_comment_id):
         self.calls.append(("media_comment", media_id, text, replied_to_comment_id))
-        if self.send_error:
-            raise TimeoutError("ambiguous provider response")
+        self.private_request(f"media/{media_id}/comment/", data={"comment_text": text})
         return SimpleNamespace(pk="reply-55")
 
     def photo_upload(self, path, caption, share_to_threads):
         self.calls.append(("photo_upload", str(path), caption, share_to_threads))
-        if self.send_error:
-            raise TimeoutError("ambiguous provider response")
+        self.private_request("media/configure/", data={"caption": caption})
         return SimpleNamespace(pk="photo-55", code="abc123")
 
 
-class InstagramAdapterTests(unittest.TestCase):
+class InstagramAdapterTests(IsolatedStateTestCase):
     def setUp(self):
+        super().setUp()
         self.temp = TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.session = self.root / "session.json"
@@ -194,6 +230,126 @@ class InstagramAdapterTests(unittest.TestCase):
         self.assertEqual(client.slides, [b"first image", b"second image"])
         self.assertEqual(client.calls[-1], ("album_upload", "Two slides", False))
         self.assertEqual(result["permalink"], "https://www.instagram.com/p/Album55/")
+
+    def _reply_job(self):
+        return self._claim(body="A reply", action="reply", media_id="media-7",
+                           target_id="1234", target_url="https://www.instagram.com/p/abc123/")
+
+    def test_exceptions_are_the_shared_adapter_contract(self):
+        self.assertIs(PreSendFailure, shared.PreSendFailure)
+        self.assertIs(AuthUnavailable, shared.AuthUnavailable)
+        self.assertIs(PublishUncertain, shared.PublishUncertain)
+        self.assertTrue(issubclass(DependencyUnavailable, PreSendFailure))
+        self.assertTrue(issubclass(PublishRejected, PreSendFailure))
+        self.assertIsInstance(InstagramAdapter(self.registry), shared.PublishingAdapter)
+
+    def test_missing_retry_guard_members_refuse_before_any_write(self):
+        job = self._reply_job()
+
+        members = {key: value for key, value in vars(FakeClient).items()
+                   if key not in ("_send_private_request", "__dict__", "__weakref__")}
+        client = type("OldClient", (), members)()
+        with self.assertRaisesRegex(PreSendFailure, "_send_private_request"):
+            InstagramAdapter(self.registry, client_factory=lambda: client).publish(job)
+        self.assertFalse(any(call[0] == "media_comment" for call in client.calls))
+
+    def test_guard_disables_session_retries_before_sending(self):
+        job = self._reply_job()
+        client = FakeClient()
+        InstagramAdapter(self.registry, client_factory=lambda: client).publish(job)
+        self.assertEqual(client.retry_total_at_configure, 0)
+        self.assertEqual(client.writes, ["media/media-7/comment/"])
+
+    def test_definite_client_error_on_the_write_is_rejected_not_uncertain(self):
+        job = self._reply_job()
+        with self.assertRaises(PublishRejected) as caught:
+            InstagramAdapter(self.registry, client_factory=lambda: FakeClient(send_error=400)).publish(job)
+        self.assertEqual(caught.exception.status_code, 400)
+
+    def test_server_error_conflict_and_timeout_stay_uncertain(self):
+        for error in (500, 408, 409, "timeout"):
+            with self.subTest(error=error):
+                job = self._reply_job()
+                with self.assertRaises(PublishUncertain):
+                    InstagramAdapter(self.registry,
+                                     client_factory=lambda: FakeClient(send_error=error)).publish(job)
+                self.box.finish(job["id"], job["lease_token"], outcome="uncertain")
+                self.box.resolve_uncertain(job["id"], outcome="failed", reason="test cleanup")
+
+    def test_local_error_before_any_write_is_pre_send(self):
+        image = self.root / "image.jpg"
+        image.write_bytes(b"not really a jpeg")
+        job = self._claim(body="A post", media_path=str(image))
+
+        class LocalFailure(FakeClient):
+            def photo_upload(self, path, caption, share_to_threads):
+                raise ValueError("Invalid file format")
+
+        client = LocalFailure()
+        with self.assertRaisesRegex(PreSendFailure, "before any public write") as caught:
+            InstagramAdapter(self.registry, client_factory=lambda: client).publish(job)
+        self.assertNotIsInstance(caught.exception, PublishRejected)
+        self.assertEqual(client.writes, [])
+
+    def test_auth_refusal_before_any_write_keeps_the_job_queued(self):
+        job = self._reply_job()
+
+        class LoginRequired(Exception):
+            pass
+
+        class RefusedRead(FakeClient):
+            def media_comment(self, media_id, text, replied_to_comment_id):
+                raise LoginRequired("private body")
+
+        with self.assertRaises(AuthUnavailable):
+            InstagramAdapter(self.registry, client_factory=RefusedRead).publish(job)
+
+    def test_unreadable_answer_after_a_completed_write_is_uncertain(self):
+        job = self._reply_job()
+
+        class NoReceipt(FakeClient):
+            def media_comment(self, media_id, text, replied_to_comment_id):
+                self.private_request("media/comment/", data={"comment_text": text})
+                raise KeyError("media")
+
+        with self.assertRaises(PublishUncertain):
+            InstagramAdapter(self.registry, client_factory=NoReceipt).publish(job)
+
+    def test_before_send_runs_after_checks_and_can_stop_the_write(self):
+        job = self._reply_job()
+        client = FakeClient()
+
+        def stop():
+            self.assertIn(("account_info",), client.calls)
+            raise PreSendFailure("stopped at the boundary")
+
+        with self.assertRaisesRegex(PreSendFailure, "boundary"):
+            InstagramAdapter(self.registry, client_factory=lambda: client).publish(job, before_send=stop)
+        self.assertEqual(client.writes, [])
+
+    def test_missing_instagrapi_is_a_dependency_problem_with_install_hint(self):
+        job = self._reply_job()
+
+        def missing():
+            raise ImportError("instagrapi")
+
+        with self.assertRaises(DependencyUnavailable) as caught:
+            InstagramAdapter(self.registry, client_factory=missing).publish(job)
+        self.assertEqual(caught.exception.install_hint, install_command("instagram"))
+        self.assertIn("[instagram]", caught.exception.install_hint)
+
+    @unittest.skipUnless(importlib.util.find_spec("instagrapi"), "instagrapi not installed")
+    def test_pinned_instagrapi_client_has_the_single_write_guard_members(self):
+        from instagrapi import Client
+        client = Client()
+        for name in ("_configure_private_session_retry", "_send_private_request",
+                     "private_request", "session_retry_total"):
+            self.assertTrue(hasattr(client, name), name)
+        adapter = InstagramAdapter(self.registry)
+        adapter.client = client
+        adapter._single_write_attempt()
+        self.assertEqual(client.session_retry_total, 0)
+        self.assertEqual(client.private_request.__name__, "once")
 
     def test_carousel_changed_slide_fails_before_any_provider_send(self):
         first = self.root / "one.jpg"

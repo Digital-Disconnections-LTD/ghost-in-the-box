@@ -3,7 +3,9 @@
 
 Run with the Instagram extra installed. A current authenticator code is read
 from stdin when --verification-code-stdin is given; it is never stored or echoed.
-Credentials remain in ~/.batbox/social-farm-creds/ig.json.
+Credentials are a private JSON file with username and password; run
+`ghost-in-the-box config` to see the default location. The browser login wizard
+(`ghost-in-the-box login start --platform instagram`) needs no password file.
 """
 
 import argparse
@@ -16,36 +18,69 @@ import stat
 import sys
 import tempfile
 
-from instagrapi import Client
+try:
+    from instagrapi import Client
+except ImportError:
+    Client = None
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from farm.config import STATE_ROOT
+from farm.cli_output import EXIT_AUTH, EXIT_USAGE, emit, failure, guarded
+from farm.config import credentials_path, install_command, instagram_sessions_dir
 
 
-CREDENTIALS = Path.home() / ".batbox/social-farm-creds/ig.json"
-STATE_DIR = STATE_ROOT / 'ig'
+CREDENTIALS = credentials_path()
+STATE_DIR = instagram_sessions_dir()
+WIZARD = "ghost-in-the-box login start --platform instagram --account YOUR_HANDLE"
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--verification-code-stdin", action="store_true")
-    parser.add_argument("--credentials", type=Path, default=CREDENTIALS,
-                        help="private JSON with username and password")
-    args = parser.parse_args()
+def _credentials_failure(path: Path, reason: str, hint: str) -> dict:
+    message = f"Instagram credentials at {path} {reason}."
+    # Top-level message and hint stay for callers that read them before the envelope.
+    return failure("private_credentials_unavailable", message, hint, message=message, hint=hint,
+                   credentials_path=str(path))
+
+
+@guarded("instagram-login")
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--verification-code-stdin", action="store_true",
+                        help="read a current 6- or 8-digit authenticator code from stdin")
+    parser.add_argument("--credentials", type=Path, default=CREDENTIALS, metavar="PATH",
+                        help="private JSON with username and password (default: see ghost-in-the-box config)")
+    args = parser.parse_args(argv)
     os.umask(0o077)
+    if Client is None:
+        emit(failure("dependency_unavailable", "instagram-login needs the 'instagram' extra.",
+                     install_command("instagram")))
+        return EXIT_AUTH
 
     code = ""
     if args.verification_code_stdin:
         code = sys.stdin.readline().strip()
         if not code.isdecimal() or len(code) not in (6, 8):
-            print(json.dumps({"ok": False, "error": "expected a current 6- or 8-digit code on stdin"}))
-            return 2
+            emit(failure("invalid_code_format", "expected a current 6- or 8-digit code on stdin",
+                         "echo 123456 | ghost-in-the-box instagram-login --verification-code-stdin"))
+            return EXIT_USAGE
 
+    credential_path = args.credentials.expanduser()
+    example = '{"username": "YOUR_HANDLE", "password": "..."}'
     try:
-        credential_path = args.credentials.expanduser()
-        mode = credential_path.stat().st_mode
-        if credential_path.is_symlink() or not stat.S_ISREG(mode) or mode & 0o077:
-            raise ValueError("credentials must be a private regular file")
+        mode = credential_path.lstat().st_mode
+    except OSError:
+        emit(_credentials_failure(
+            credential_path, "were not found",
+            f"create that file containing {example} and run chmod 600 on it, "
+            f"or pass --credentials PATH; no password needed with: {WIZARD}"))
+        return EXIT_USAGE
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        emit(_credentials_failure(
+            credential_path, "are not a regular file", f"replace it with a regular file containing {example}"))
+        return EXIT_USAGE
+    if mode & 0o077:
+        emit(_credentials_failure(
+            credential_path, "are readable by other users", f"chmod 600 '{credential_path}'"))
+        return EXIT_USAGE
+    try:
         credentials = json.loads(credential_path.read_text())
         if (not isinstance(credentials, dict) or
                 not isinstance(credentials.get("username"), str) or
@@ -53,8 +88,10 @@ def main() -> int:
                 not isinstance(credentials.get("password"), str) or not credentials["password"]):
             raise ValueError("username and password are required")
     except (OSError, ValueError, AttributeError):
-        print(json.dumps({"ok": False, "error": "private_credentials_unavailable"}))
-        return 2
+        emit(_credentials_failure(
+            credential_path, "need a valid Instagram username and a password",
+            f"the file must contain {example}"))
+        return EXIT_USAGE
     client = Client()
     client.delay_range = [2, 5]
     path = STATE_DIR / f"{credentials['username']}.json"
@@ -87,12 +124,17 @@ def main() -> int:
             "user_id": str(client.user_id),
             "session_state": str(path),
             "saved_at": datetime.now(timezone.utc).isoformat(),
+            "next": (f"ghost-in-the-box accounts register --platform instagram --account {credentials['username']} "
+                     f"--kind instagrapi_settings --session-file '{path}'"),
         }))
         return 0
     except Exception as exc:
         # Provider error text may contain authentication context.
-        print(json.dumps({"ok": False, "error_type": type(exc).__name__}))
-        return 1
+        message = "Instagram did not complete the login; nothing was saved."
+        hint = ("if Instagram asked for a code, rerun with --verification-code-stdin; "
+                f"or use the browser wizard: {WIZARD}")
+        emit(failure("login_failed", message, hint, error_type=type(exc).__name__, message=message, hint=hint))
+        return EXIT_AUTH
 
 
 if __name__ == "__main__":

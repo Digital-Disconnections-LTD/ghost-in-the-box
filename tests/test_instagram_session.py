@@ -113,6 +113,42 @@ class SessionTests(unittest.TestCase):
         self.assertEqual((replacement.token, replacement.user_id, replacement.username),
                          (token, "123", "writer"))
 
+    def test_unavailable_session_says_which_path_and_what_to_run(self):
+        from farm.accounts import AccountRegistry
+        registry = AccountRegistry(Path(self.temp.name) / "accounts.json")
+        with self.assertRaises(InstagramSessionError) as caught:
+            read_with_session("writer", lambda client: None, registry=registry, client_factory=Client)
+        error = caught.exception
+        self.assertEqual(str(error), "session_unavailable")
+        self.assertIn(str(registry.path), error.message)
+        self.assertEqual(error.hint, "ghost-in-the-box login start --platform instagram --account writer")
+        self.assertEqual(set(error.to_error()), {"code", "message", "hint"})
+        registry.register(platform="instagram", account="writer", kind="instagrapi_settings",
+                          session_file=self.path)
+        self.path.chmod(0o644)
+        with self.assertRaises(InstagramSessionError) as caught:
+            read_with_session("writer", lambda client: None, registry=registry, client_factory=Client)
+        self.assertIn(str(self.path), caught.exception.message)
+        self.assertIn("chmod 600", caught.exception.hint)
+        self.path.unlink()
+        with self.assertRaises(InstagramSessionError) as caught:
+            read_with_session("writer", lambda client: None, registry=registry, client_factory=Client)
+        self.assertIn("missing", caught.exception.message)
+        self.assertIn(str(self.path), caught.exception.message)
+
+    def test_cooldown_file_is_written_without_posix_only_calls(self):
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+        from farm import instagram_session, session_files
+        self.assertNotIn("os.fchmod", Path(instagram_session.__file__).read_text())
+        when = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        with patch.object(session_files, "os", SimpleNamespace(name="nt")), \
+                patch.object(session_files, "protect") as protect:
+            instagram_session._write_retry_after(self.path, when)
+            self.assertEqual(instagram_session._read_retry_after(self.path), when)
+        protect.assert_called_once()
+        self.assertTrue(protect.call_args.args[0].name.startswith(".ig-recovery-"))
+
 
 if __name__ == "__main__":
     unittest.main()

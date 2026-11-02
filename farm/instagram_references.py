@@ -7,7 +7,8 @@ from farm.config import STATE_ROOT
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import fcntl
+from farm import locking as fcntl
+from farm.session_files import protect_descriptor
 import hashlib
 import json
 import os
@@ -108,7 +109,7 @@ def fetch_image(url, destination, byte_limit, *, deadline=None, session_factory=
             digest = hashlib.sha256()
             prefix = b""
             with open(destination, "wb") as stream:
-                os.fchmod(stream.fileno(), 0o600)
+                protect_descriptor(stream.fileno(), Path(destination))
                 for chunk in response.iter_content(chunk_size=64 * 1024):
                     if time.monotonic() >= deadline:
                         raise ReferenceError("download time budget exhausted")
@@ -248,12 +249,8 @@ class ReferenceStore:
         if directory.is_symlink():
             raise ReferenceError("download directory must not be a symlink")
         os.chmod(directory, 0o700)
-        fd = os.open(directory / ".lock", os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+        with fcntl.exclusive_lock(directory / ".lock"):
             yield directory
-        finally:
-            os.close(fd)
 
     def verified_image(self, path):
         original = Path(path)

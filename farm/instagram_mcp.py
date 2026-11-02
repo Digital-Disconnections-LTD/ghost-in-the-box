@@ -1,11 +1,13 @@
 """Instagram tools backed by the saved session, inbox and durable outbox.
 
-The transport lives here too: Batbox currently speaks Content-Length stdio.
+The transport lives here too: standard MCP stdio (newline-delimited JSON), plus
+Content-Length frames for framed clients such as Batbox, answered in kind.
 No provider objects, credentials, session files or raw provider errors cross it.
 """
 
 from __future__ import annotations
 
+import ast
 from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import datetime
 import io
@@ -16,28 +18,104 @@ import re
 import sys
 import uuid
 
+from farm import config
 from farm.accounts import AccountRegistry
+from farm.cli_output import error_object
 from farm.adapters.instagram import InstagramAdapter
 from farm.inbox import Inbox, sync_comments
 from farm.instagram_session import InstagramSessionError, read_with_session
 from farm.instagram_references import (
     DEFAULT_ROOT as REFERENCE_ROOT, ReferenceError, ReferenceStore, canonical_post_url, fetch_image,
 )
-from farm.outbox import Outbox, utc_text, utc_now
+from farm.outbox import JOB_STATES as OUTBOX_JOB_STATES, Outbox, utc_text, utc_now
 from scripts.instagram_carousel import ROOT as CAROUSEL_ROOT, create_draft as carousel_draft
 from scripts import meme_library
 from scripts.social_publish_job import run as publish_exact_job
 
 
-DEFAULT_ACCOUNT = "example_creator"
 MEME_ROOT = meme_library.ROOT
-PROTOCOL_VERSION = "2024-11-05"
+SERVER_NAME = "ghost-in-the-box-instagram"
+SERVER_TITLE = "Ghost in the Box: Instagram"
+# Newest first. Batching is only part of 2025-03-26, so it is accepted only there.
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0]
+BATCH_PROTOCOL_VERSIONS = frozenset({"2025-03-26"})
 MAX_MESSAGE_BYTES = 1024 * 1024
-JOB_STATES = ["draft", "queued", "in_flight", "uncertain", "published", "failed", "superseded"]
+JOB_STATES = list(OUTBOX_JOB_STATES)
+ACCOUNT_PATTERN = r"[A-Za-z0-9_.]{1,30}"
+# Handles that appear in docs and examples; they are refused unless really registered.
+PLACEHOLDER_ACCOUNTS = frozenset({"example_creator", "your_handle"})
+SUBSTACK_SERVER_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "substack_mcp_server.py"
+
+
+def login_hint(account):
+    return f"sign in with: ghost-in-the-box login start --platform instagram --account {account}"
+
+
+INSTALL_HINT = "install the Instagram extra: " + config.install_command("instagram")
 
 
 class ToolInputError(ValueError):
-    """An explicitly safe local validation message."""
+    """An explicitly safe local validation message with a stable code and next step."""
+
+    def __init__(self, message, *, code="invalid_input", hint=None):
+        super().__init__(message)
+        self.code = code
+        self.hint = hint
+
+
+class AccountSelectionError(Exception):
+    """Why the server cannot pick an Instagram account, and what to run instead."""
+
+    def __init__(self, message, hint):
+        super().__init__(message)
+        self.hint = hint
+
+
+def is_placeholder(account):
+    return account.casefold() in PLACEHOLDER_ACCOUNTS
+
+
+def resolve_account(explicit=None, *, environ=None, registry_factory=AccountRegistry):
+    """Pick the configured account: --account, SOCIAL_FARM_IG_ACCOUNT, else the only registered one."""
+    environ = os.environ if environ is None else environ
+    candidate = (explicit or environ.get("SOCIAL_FARM_IG_ACCOUNT") or "").strip()
+    if candidate and not re.fullmatch(ACCOUNT_PATTERN, candidate):
+        raise AccountSelectionError(
+            "--account must be an Instagram handle: 1-30 letters, digits, '.' or '_'",
+            "pass the handle without '@', for example --account my_handle")
+    try:
+        registry = registry_factory()
+        if candidate:
+            if is_placeholder(candidate) and registry.get("instagram", candidate) is None:
+                raise AccountSelectionError(
+                    f"'{candidate}' is the documentation placeholder, not a registered Instagram account",
+                    "pass your own handle with --account; to register it, " + login_hint("YOUR_HANDLE"))
+            return candidate
+        handles = sorted(entry["account"] for entry in registry.list() if entry["platform"] == "instagram")
+    except AccountSelectionError:
+        raise
+    except (OSError, ValueError) as error:
+        raise AccountSelectionError(
+            f"the account registry could not be read ({type(error).__name__})",
+            "run ghost-in-the-box doctor and ghost-in-the-box accounts list, or pass --account HANDLE") from None
+    if len(handles) == 1:
+        return handles[0]
+    if not handles:
+        raise AccountSelectionError("no Instagram account is registered and --account was not given",
+                                    login_hint("YOUR_HANDLE") + ", or pass --account HANDLE")
+    raise AccountSelectionError(
+        f"{len(handles)} Instagram accounts are registered ({', '.join(handles)}); choose one",
+        "pass --account HANDLE (or set SOCIAL_FARM_IG_ACCOUNT)")
+
+
+def negotiate_protocol(requested):
+    """Echo a supported client version; otherwise offer our newest one."""
+    return requested if requested in SUPPORTED_PROTOCOL_VERSIONS else LATEST_PROTOCOL_VERSION
+
+
+def server_version():
+    return config.package_version()
 
 
 def string(description, *, minimum=1, maximum=4096, pattern=None, default=None):
@@ -77,48 +155,58 @@ WORKER = string("Your stable worker name; use the same name when drafting or ski
 CURSOR = string("Opaque cursor from the previous page; omit for the first page.", minimum=0)
 
 
-def tool(name, description, properties=None, required=(), *, read_only=False, external=False):
-    return {"name": f"instagram_{name}", "description": description,
+def tool(name, title, description, properties=None, required=(), *, read_only=False, external=False,
+         destructive=False):
+    # title is the 2025-06-18 field; annotations.title serves 2025-03-26 clients.
+    return {"name": f"instagram_{name}", "title": title, "description": description,
             "inputSchema": {"type": "object", "properties": properties or {},
                             "required": list(required), "additionalProperties": False},
-            "annotations": {"readOnlyHint": read_only, "destructiveHint": False,
+            "annotations": {"title": title, "readOnlyHint": read_only, "destructiveHint": destructive,
                             "openWorldHint": external}}
 
 
 TOOLS = [
-    tool("status", "Check configured Instagram account, local session readiness and job counts. "
+    tool("status", "Instagram account status",
+         "Check configured Instagram account, local session readiness and job counts. "
          "live_check optionally validates the saved login; no credentials are returned.",
          {"live_check": boolean("Validate the saved session with Instagram.")}, read_only=True, external=True),
-    tool("own_posts", "Read one complete page (up to 33) of the connected account's own Instagram posts. "
+    tool("own_posts", "Read own Instagram posts",
+         "Read one complete page (up to 33) of the connected account's own Instagram posts. "
          "Returns captions, IDs, links and a continuation cursor.", {"cursor": CURSOR}, read_only=True, external=True),
-    tool("media", "Read any accessible Instagram post's caption, author and slide URLs. "
+    tool("media", "Read an Instagram post",
+         "Read any accessible Instagram post's caption, author and slide URLs. "
          "Supply exactly one of media_id or url. Use download_media for local images and inspect_slide to see them.",
          {"media_id": MEDIA_ID, "url": POST_URL}, read_only=True, external=True),
-    tool("discover", "Discover topic posts with one bounded Instagram hashtag page using the saved session. "
+    tool("discover", "Discover posts by hashtag",
+         "Discover topic posts with one bounded Instagram hashtag page using the saved session. "
          "Try artificialintelligence, machinelearning, softwareengineering, programming or developerlife. "
          "Returns up to limit posts and saves their metadata for references/curate. Does not download images.",
          {"hashtag": HASHTAG, "sort": choice("Provider hashtag ranking.", ["top", "recent"], "top"),
           "limit": integer("Maximum posts returned and saved from one provider page.", 12, 1, 30)},
          ["hashtag"], external=True),
-    tool("references", "Browse saved Instagram research candidates and downloaded image paths locally. "
+    tool("references", "Browse saved research posts",
+         "Browse saved Instagram research candidates and downloaded image paths locally. "
          "Selections and notes survive later discovery refreshes. This store is separate from the meme library.",
          {"state": choice("Curation filter.", ["new", "selected", "skipped", "all"], "new"),
           "hashtag": HASHTAG, "query": string("Literal caption or author text filter.", maximum=200),
           "limit": integer("Maximum saved posts.", 20, 1, 50),
           "offset": integer("Continue at next_offset from the previous result.", 0, 0, 10000)}, read_only=True),
-    tool("curate", "Mark a saved Instagram research candidate new, selected or skipped and retain a note. "
+    tool("curate", "Curate a saved research post",
+         "Mark a saved Instagram research candidate new, selected or skipped and retain a note. "
          "Changes only the private local reference store.",
          {"media_id": MEDIA_ID, "state": choice("Curation state.", ["new", "selected", "skipped"]),
           "note": string("Why this post is useful or should be skipped.", minimum=0, maximum=2000, default="")},
          ["media_id", "state"]),
-    tool("download_media", "Download images from one Instagram post or carousel, including other authors' posts. "
+    tool("download_media", "Download post images",
+         "Download images from one Instagram post or carousel, including other authors' posts. "
          "Supply exactly one of media_id or url. Returns ordered absolute slide paths, source URL, author, "
          "caption and IDs. Video slides yield preview images. Private local snapshots are reused; images are "
          "limited to 8 MB each, 64 MB and at most 20 slides per call. Follow next_start_index for remaining slides.",
          {"media_id": MEDIA_ID, "url": POST_URL,
           "max_images": integer("Maximum images for this call.", 10, 1, 20),
           "start_index": integer("One-based slide index to start or resume.", 1, 1, 100)}, external=True),
-    tool("inspect_slide", "See one downloaded Instagram image using the existing local vision model. "
+    tool("inspect_slide", "Inspect a downloaded image",
+         "See one downloaded Instagram image using the existing local vision model. "
          "Reads visible words and explains the visual in a concise answer. Accepts only an unchanged absolute "
          "image path returned by download_media; image bytes stay on this machine.",
          {"image_path": string("Absolute downloaded slide path."),
@@ -126,7 +214,8 @@ TOOLS = [
              default="Describe what is visually happening, read the visible words, and explain the joke or argument in three concise sentences."),
           "max_tokens": integer("Maximum local-model output tokens.", 500, 64, 1000)},
          ["image_path"], read_only=True),
-    tool("search_memes", "Search the cached technology meme library by topic and words in titles or images. "
+    tool("search_memes", "Search the meme library",
+         "Search the cached technology meme library by topic and words in titles or images. "
          "Returns IDs, local image paths, source links, observed engagement and short OCR excerpts. "
          "Use IDs with prepare_meme_carousel; use next_offset for more matches. Reads only local files.",
          {"query": string("Words to find in titles and OCR text, for example Claude or debugging.", minimum=0, maximum=200, default=""),
@@ -135,40 +224,50 @@ TOOLS = [
           "offset": integer("Continue at next_offset from a previous result.", 0, 0, 10000),
           "min_score": integer("Minimum recorded native engagement count; scores and likes are labeled.", 0, 0, 1000000000)},
          read_only=True),
-    tool("import_meme", "Add one image already returned by download_media to the categorized meme library. "
+    tool("import_meme", "Add an image to the meme library",
+         "Add one image already returned by download_media to the categorized meme library. "
          "Source URL, author, caption and engagement are read from its saved download record automatically. "
          "Deduplicates, OCRs and indexes the image, then returns its library ID and cached path. Local files only.",
          {"image_path": string("Unchanged absolute image path returned by download_media.")}, ["image_path"]),
-    tool("prepare_meme_carousel", "Prepare 2–10 cached meme IDs or paths as ordered 1080×1350 JPEG slides. "
+    tool("prepare_meme_carousel", "Prepare meme carousel slides",
+         "Prepare 2–10 cached meme IDs or paths as ordered 1080×1350 JPEG slides. "
          "Pads without cropping and preserves originals. Returns images and source_urls to pass directly "
          "to draft_carousel with your caption and idempotency_key. Creates local files; does not draft or publish.",
          {"items": {"type": "array", "minItems": 2, "maxItems": 10,
                     "items": string("Meme ID or cached image path from search_memes or import_meme.")}}, ["items"]),
-    tool("comments", "Read one complete comment page on your own Instagram media and retain it in the inbox. "
+    tool("comments", "Read comments on own post",
+         "Read one complete comment page on your own Instagram media and retain it in the inbox. "
          "Supply comment_id to read that comment's replies. Returned cursor continues the same stream.",
          {"media_id": MEDIA_ID, "comment_id": COMMENT_ID, "cursor": CURSOR},
          ["media_id"], external=True),
-    tool("sync_inbox", "Refresh a bounded selection of own-media comments and optional feed. "
+    tool("sync_inbox", "Refresh the comment inbox",
+         "Refresh a bounded selection of own-media comments and optional feed. "
          "Uses durable cursors; older continues historical scans. No comments are marked reviewed.",
          {"posts": integer("Own posts to scan.", 3, 1, 10),
           "pages": integer("Comment pages per post.", 1, 1, 3),
           "threads": integer("Parent comments whose reply pages to scan per page.", 0, 0, 5),
           "feed_pages": integer("Timeline pages to retain.", 0, 0, 3),
           "older": boolean("Continue saved historical cursors.")}, external=True),
-    tool("inbox", "Read cached unread comments, pending reviews, or feed items without consuming them. "
+    tool("inbox", "Read the cached inbox",
+         "Read cached unread comments, pending reviews, or feed items without consuming them. "
          "Call sync_inbox for fresh provider data.",
          {"view": choice("Cached view.", ["unread", "pending", "feed"], "unread"),
           "limit": integer("Maximum records.", 20, 1, 100), "worker": WORKER}, read_only=True),
-    tool("claim_comments", "Claim unread comments for review for one hour. "
+    tool("claim_comments", "Claim comments for review",
+         "Claim unread comments for review for one hour. "
          "Use the worker name for draft_reply and skip_comment; expired claims become available again.",
          {"worker": WORKER, "limit": integer("Maximum comments.", 10, 1, 100)}, ["worker"]),
-    tool("skip_comment", "Finish a claimed comment review without replying.",
+    tool("skip_comment", "Skip a claimed comment",
+         "Finish a comment review claimed with claim_comments without replying. "
+         "Use the same worker name that claimed it.",
          {"comment_id": COMMENT_ID, "worker": WORKER}, ["comment_id", "worker"]),
-    tool("draft_reply", "Save the exact reply text for a claimed inbox comment. "
+    tool("draft_reply", "Draft a comment reply",
+         "Save the exact reply text for a claimed inbox comment. "
          "Returns one durable draft per comment; repeat the same text to recover the same job. Does not publish.",
          {"comment_id": COMMENT_ID, "text": string("Exact reply text.", maximum=2200), "worker": WORKER},
          ["comment_id", "text", "worker"]),
-    tool("draft_carousel", "Snapshot 2–10 ordered local images and an exact caption into one Instagram draft. "
+    tool("draft_carousel", "Draft a carousel post",
+         "Snapshot 2–10 ordered local images and an exact caption into one Instagram draft. "
          "Reuse the same idempotency_key for retries; changed content with that key is rejected. "
          "Then queue_job and publish_job using the returned job ID.",
          {"caption": string("Exact caption, including line breaks.", minimum=0, maximum=2200),
@@ -179,20 +278,25 @@ TOOLS = [
           "source_urls": {"type": "array", "maxItems": 30,
                           "items": string("Source URL retained with the draft.")}},
          ["caption", "images", "idempotency_key"]),
-    tool("queue_job", "Freeze and queue one exact Instagram draft. Does not send. "
+    tool("queue_job", "Queue a draft job",
+         "Freeze and queue one exact Instagram draft. Does not send. "
          "Publishers are not started by this server; publish_job explicitly sends the selected job.",
          {"job_id": JOB_ID, "at": string("Optional ISO 8601 schedule with timezone; default now.", maximum=100)},
          ["job_id"]),
-    tool("publish_job", "Publish exactly one queued Instagram job now, including a future-scheduled job. "
+    tool("publish_job", "Publish a queued job",
+         "Publish exactly one queued Instagram job now, including a future-scheduled job. "
          "Repeated calls for a published job return its receipt. Ambiguous sends become uncertain and cannot "
          "be resent until reconciled. Auth failures preserve the queue. This makes a public post or reply.",
-         {"job_id": JOB_ID}, ["job_id"], external=True),
-    tool("jobs", "List bounded Instagram job summaries for this configured account.",
+         {"job_id": JOB_ID}, ["job_id"], external=True, destructive=True),
+    tool("jobs", "List Instagram jobs",
+         "List bounded Instagram job summaries for this configured account.",
          {"status": choice("Job status filter.", ["active", "all", *JOB_STATES], "active"),
           "limit": integer("Maximum jobs.", 20, 1, 100)}, read_only=True),
-    tool("job", "Inspect one Instagram job's exact text, frozen assets, target and durable outcome. "
+    tool("job", "Inspect one Instagram job",
+         "Inspect one Instagram job's exact text, frozen assets, target and durable outcome. "
          "Lease tokens and session settings are omitted.", {"job_id": JOB_ID}, ["job_id"], read_only=True),
-    tool("reconcile_job", "Resolve an uncertain Instagram job using observed evidence. "
+    tool("reconcile_job", "Reconcile an uncertain job",
+         "Resolve an uncertain Instagram job using observed evidence. "
          "For published, supply the observed provider_id: the server verifies the account and exact text "
          "against Instagram before recording it. For queued or failed, reason must explain direct evidence "
          "that no public write happened; a missing item in a bounded read is not proof. "
@@ -200,7 +304,8 @@ TOOLS = [
          {"job_id": JOB_ID, "outcome": choice("Evidence-supported outcome.", ["published", "queued", "failed"]),
           "reason": string("Concrete reconciliation evidence.", maximum=4000), "provider_id": MEDIA_ID},
          ["job_id", "outcome", "reason"], external=True),
-    tool("retry_job", "Requeue a failed-before-send Instagram job after correcting the failure. "
+    tool("retry_job", "Retry a failed job",
+         "Requeue a failed-before-send Instagram job after correcting the failure. "
          "Requires unchanged frozen content and a reason. Does not send and cannot retry uncertain jobs.",
          {"job_id": JOB_ID, "reason": string("What corrected the pre-send failure.", maximum=4000)},
          ["job_id", "reason"]),
@@ -244,8 +349,16 @@ def validate(value, schema, field="arguments"):
             validate(item, schema["items"], field)
 
 
+RETRY_PAGE_HINT = "nothing was saved and no cursor advanced; call again later with the same arguments"
+RECEIPT_HINT = ("the job stays uncertain; confirm the provider_id on the account's own post or reply, "
+                "then call instagram_reconcile_job again")
+
+
 def _new_client():
-    from instagrapi import Client
+    try:
+        from instagrapi import Client
+    except ImportError:
+        raise InstagramSessionError("dependency_unavailable") from None
     client = Client()
     client.with_challenge_flow = False
     client.delay_range = [2, 5]
@@ -289,12 +402,12 @@ def _job_summary(job, *, detail=False):
 
 
 class InstagramTools:
-    def __init__(self, *, account=DEFAULT_ACCOUNT, outbox_path=None, inbox_path=None,
+    def __init__(self, *, account, outbox_path=None, inbox_path=None,
                  carousel_root=CAROUSEL_ROOT, registry=None, client_factory=None,
                  reader=None, adapter_factory=None, reference_root=REFERENCE_ROOT,
                  image_fetcher=None, vision_inspector=None, meme_root=MEME_ROOT):
-        if not isinstance(account, str) or not re.fullmatch(r"[A-Za-z0-9_.]{1,30}", account):
-            raise ToolInputError("invalid configured account")
+        if not isinstance(account, str) or not re.fullmatch(ACCOUNT_PATTERN, account):
+            raise ToolInputError("invalid configured account", code="invalid_account")
         self.account = account
         self.outbox_path = outbox_path
         self.inbox_path = inbox_path
@@ -331,17 +444,31 @@ class InstagramTools:
     def selected(self, box, job_id):
         job = box.get(job_id)
         if not job or job["platform"] != "instagram" or job["account"] != self.account:
-            raise ToolInputError("Instagram job not found for the configured account")
+            raise ToolInputError("Instagram job not found for the configured account", code="job_not_found",
+                                 hint="list this account's job IDs with instagram_jobs")
         return job
 
     def call(self, name, arguments):
         if name not in TOOL_BY_NAME:
-            raise ToolInputError("unknown Instagram tool")
+            raise ToolInputError("unknown Instagram tool", code="unknown_tool",
+                                 hint="call tools/list for the available names")
+        self.require_real_account()
         schema = TOOL_BY_NAME[name]["inputSchema"]
-        validate(arguments, schema)
+        try:
+            validate(arguments, schema)
+        except ToolInputError as error:
+            raise ToolInputError(str(error), code="invalid_arguments",
+                                 hint=f"match the inputSchema of {name} from tools/list") from None
         args = {key: prop["default"] for key, prop in schema["properties"].items() if "default" in prop}
         args.update(arguments)
         return getattr(self, name.removeprefix("instagram_"))(**args)
+
+    def require_real_account(self):
+        # A copied example config must not quietly read and write an empty fake account.
+        if is_placeholder(self.account) and self.registry.get("instagram", self.account) is None:
+            raise ToolInputError(f"'{self.account}' is the documentation placeholder, not a registered account",
+                code="placeholder_account",
+                hint="restart the server with --account set to your own registered Instagram handle")
 
     def status(self, live_check=False):
         entry = self.registry.status("instagram", self.account)
@@ -355,6 +482,8 @@ class InstagramTools:
         result = {"ok": True, "account": self.account, "session_ready": available,
                   "live_checked": False, "jobs": counts,
                   "publishing": "explicit queued job IDs only"}
+        if not available:
+            result["hint"] = login_hint(self.account)
         if live_check:
             result["user_id"] = self.read(lambda client: str(client.user_id))
             result["live_checked"] = True
@@ -368,7 +497,8 @@ class InstagramTools:
             if (not isinstance(response, dict) or response.get("status") != "ok" or
                     not isinstance(response.get("items"), list) or len(items) > 33 or
                     len(response["items"]) != len(items)):
-                raise ToolInputError("Instagram media page was not complete; cursor was not advanced")
+                raise ToolInputError("Instagram media page was not complete; cursor was not advanced",
+                                     code="provider_incomplete", hint=RETRY_PAGE_HINT)
             own = [item for item in items if str(item.user.pk) == str(client.user_id)]
             return {"ok": True, "account": self.account, "posts": [_media(item) for item in own],
                     "other_authors_skipped": len(items) - len(own), "next_cursor": next_cursor or ""}
@@ -382,7 +512,8 @@ class InstagramTools:
             pk = client.media_pk_from_url(canonical) if canonical else media_id.split("_")[0]
             item = client.media_info_v1(pk)
             if str(item.pk) != str(pk):
-                raise ToolInputError("Instagram returned a different media ID")
+                raise ToolInputError("Instagram returned a different media ID", code="provider_mismatch",
+                                     hint="check the media_id or URL and call again")
             return _media(item)
         return self.read(operation)
 
@@ -397,7 +528,7 @@ class InstagramTools:
             response = client.last_json
             if (not isinstance(response, dict) or response.get("status") != "ok" or
                     not isinstance(response.get("sections"), list) or len(items) > limit):
-                raise ToolInputError("Instagram did not acknowledge a bounded hashtag page")
+                raise ToolInputError("Instagram did not acknowledge a bounded hashtag page", code="provider_incomplete", hint=RETRY_PAGE_HINT)
             return [_media(item) for item in items]
         records = self.read(operation)
         with ReferenceStore(self.account, self.reference_root) as store:
@@ -471,7 +602,8 @@ class InstagramTools:
         try:
             result = meme_library.import_local(self.meme_root, Path(image["path"]), metadata)
         except ValueError:
-            raise ToolInputError("downloaded image could not be imported; use a supported image within the library bounds") from None
+            raise ToolInputError("downloaded image could not be imported; use a supported image within the library bounds",
+                                 code="import_rejected") from None
         urls = result["source_urls"]
         return {"ok": True, **result, "source_urls": urls[:30], "source_count": len(urls),
                 "provider_id": image["media_pk"], "slide_index": image["slide_index"]}
@@ -490,7 +622,8 @@ class InstagramTools:
         def operation(client):
             post = client.media_info_v1(media_id.split("_")[0])
             if str(post.user.pk) != str(client.user_id):
-                raise ToolInputError("comment inbox reads require the connected account's own media")
+                raise ToolInputError("comment inbox reads require the connected account's own media",
+                                     code="not_own_media", hint="pick a media_id from instagram_own_posts")
             client.last_json = {}
             if comment_id:
                 items, next_cursor = client.media_comment_replies_chunk(str(post.id), comment_id,
@@ -503,7 +636,8 @@ class InstagramTools:
             if (not isinstance(response, dict) or response.get("status") != "ok" or
                     not isinstance(response.get(field), list) or len(items) > 100 or
                     len(response[field]) != len(items)):
-                raise ToolInputError("Instagram comment page was not complete; cursor was not advanced")
+                raise ToolInputError("Instagram comment page was not complete; cursor was not advanced",
+                                     code="provider_incomplete", hint=RETRY_PAGE_HINT)
             with self._inbox() as inbox:
                 for item in items:
                     inbox.save_comment(self.account, str(post.id), str(post.code), item, parent_id=comment_id)
@@ -599,28 +733,34 @@ class InstagramTools:
                 item = client.media_info_v1(provider_id.split("_")[0])
                 if (str(item.pk) != provider_id.split("_")[0] or
                         str(item.user.pk) != str(client.user_id) or item.caption_text != job["body"]):
-                    raise ToolInputError("observed post does not match the queued account and text")
+                    raise ToolInputError("observed post does not match the queued account and text",
+                                         code="receipt_mismatch", hint=RECEIPT_HINT)
                 taken_at = getattr(item, "taken_at", None)
                 created_at = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))
                 if not isinstance(taken_at, datetime) or taken_at.tzinfo is None or taken_at < created_at:
-                    raise ToolInputError("observed post predates the draft or has no verifiable timestamp")
+                    raise ToolInputError("observed post predates the draft or has no verifiable timestamp",
+                                         code="receipt_mismatch", hint=RECEIPT_HINT)
                 if job.get("media_path") and Path(job["media_path"]).name == "carousel.json":
                     manifest = json.loads(Path(job["media_path"]).read_text(encoding="utf-8"))
                     if len(getattr(item, "resources", None) or []) != len(manifest["items"]):
-                        raise ToolInputError("observed carousel has a different slide count")
+                        raise ToolInputError("observed carousel has a different slide count",
+                                             code="receipt_mismatch", hint=RECEIPT_HINT)
                 return {"provider_id": str(item.pk), "permalink": _media(item)["url"]}
             post = client.media_info_v1(job["media_id"].split("_")[0])
             if str(post.user.pk) != str(client.user_id):
-                raise ToolInputError("reply reconciliation requires the connected account's own media")
+                raise ToolInputError("reply reconciliation requires the connected account's own media",
+                                     code="not_own_media", hint=RECEIPT_HINT)
             items, _ = client.media_comment_replies_chunk(str(post.id), str(job["target_id"]),
                                                           max_amount=100, min_id=None)
             for item in items:
                 if str(item.pk) == provider_id:
                     if str(item.user.pk) != str(client.user_id) or item.text != job["body"]:
-                        raise ToolInputError("observed reply does not match the queued account and text")
+                        raise ToolInputError("observed reply does not match the queued account and text",
+                                             code="receipt_mismatch", hint=RECEIPT_HINT)
                     return {"provider_id": str(item.pk),
                             "permalink": f"{_media(post)['url']}?comment_id={item.pk}"}
-            raise ToolInputError("provider reply was not verified on this bounded page; job remains uncertain")
+            raise ToolInputError("provider reply was not verified on this bounded page; job remains uncertain",
+                                 code="receipt_unverified", hint=RECEIPT_HINT)
         return self.read(operation)
 
     def reconcile_job(self, job_id, outcome, reason, provider_id=None):
@@ -628,14 +768,13 @@ class InstagramTools:
             job = self.selected(box, job_id)
             # A server crash may leave the named job leased. Only an expired
             # lease can become uncertain; an active sender must keep ownership.
+            # The outbox keeps the expired token, so the original sender can still record a late receipt.
             if job["status"] == "in_flight" and job["lease_until"] and job["lease_until"] <= utc_text(utc_now()):
-                box.db.execute("""UPDATE jobs SET status='uncertain',lease_token=NULL,lease_until=NULL,
-                    last_error='lease expired before receipt',updated_at=?
-                    WHERE id=? AND status='in_flight' AND lease_until<=?""",
-                    (utc_text(utc_now()), job_id, utc_text(utc_now())))
+                box.expire_leases()
                 job = self.selected(box, job_id)
             if job["status"] != "uncertain":
-                raise ToolInputError("only an uncertain job can be reconciled")
+                raise ToolInputError("only an uncertain job can be reconciled", code="not_uncertain",
+                                     hint="check the job's status with instagram_job")
         receipt = {}
         if outcome == "published":
             if not provider_id:
@@ -654,25 +793,162 @@ class InstagramTools:
         return {"ok": True, "job": _job_summary(job, detail=True)}
 
 
+SESSION_ERRORS = {
+    "session_unavailable": "no private Instagram session is registered for this account",
+    "account_mismatch": "the saved session belongs to a different Instagram account",
+    "auth_cooldown": "a recent automatic re-login failed, so Instagram reads are paused for 30 minutes",
+    "checkpoint_required": "Instagram asked for a verification step this server cannot answer",
+    "dependency_unavailable": "the Instagram client library is not installed",
+    "session_save_failed": "the refreshed Instagram session could not be saved privately",
+}
+# Publisher statuses, mapped to next steps an MCP client can take with these tools.
+UNCERTAIN_HINT = ("do not draft it again; check the account for the post, then call instagram_reconcile_job "
+                  "with that evidence")
+PUBLISH_ERRORS = {
+    "not_found": ("Instagram job not found", "list job IDs with instagram_jobs"),
+    "not_queued": ("only a queued job can be published",
+                   "check its status with instagram_job; queue a draft with instagram_queue_job, "
+                   "or resolve an uncertain job with instagram_reconcile_job"),
+    "not_claimable": ("another job for this account is in flight or uncertain",
+                      "resolve that job first (instagram_jobs, then instagram_reconcile_job), then publish again"),
+    "auth_unavailable": ("the saved Instagram session could not be used; the job stays queued", None),
+    "dependency_unavailable": ("the Instagram client library is not installed; the job stays queued", INSTALL_HINT),
+    "adapter_unavailable": ("the Instagram publisher could not start; the job stays queued",
+                            INSTALL_HINT + ", then run ghost-in-the-box doctor"),
+    "rejected": ("Instagram refused the job before publishing it",
+                 "inspect it with instagram_job, change what was refused, then call instagram_retry_job"),
+    "failed_before_send": ("the job failed before anything was sent",
+                           "inspect it with instagram_job, correct the cause, then call instagram_retry_job"),
+    "uncertain": ("the send started but its outcome is unknown, so the job is now uncertain", UNCERTAIN_HINT),
+    "lease_lost": ("the publisher lost its claim, so the outcome was not recorded", UNCERTAIN_HINT),
+    "receipt_not_recorded": ("the post may be live but its receipt was not recorded", UNCERTAIN_HINT),
+    "outbox_refused": ("the outbox refused this job", "inspect it with instagram_job"),
+    "outbox_unavailable": ("the local outbox database could not be used",
+                           "call again shortly; if it persists, run ghost-in-the-box doctor"),
+    "unsupported_platform": ("this job is not an Instagram job", "list Instagram job IDs with instagram_jobs"),
+}
+# Outbox refusals whose own hints name CLI commands; MCP clients get the matching tool.
+OUTBOX_HINTS = {
+    "not_found": "list this account's job IDs with instagram_jobs",
+    "not_draft": "check its status with instagram_job; only a draft can be queued",
+    "not_uncertain": "check its status with instagram_job",
+    "not_failed": "check its status with instagram_job; only a failed job can be retried",
+    "idempotency_conflict": "use a new idempotency_key, or inspect the existing job with instagram_jobs",
+}
+NOT_QUEUED_HINTS = {
+    "draft": "queue it with instagram_queue_job, then call instagram_publish_job",
+    "uncertain": "resolve it with instagram_reconcile_job before anything else",
+    "failed": "if nothing was sent, requeue it with instagram_retry_job",
+    "published": "it is already published; instagram_job shows the receipt",
+    "in_flight": "another publisher holds it; check again shortly with instagram_job",
+    "cancelled": "it was cancelled; draft the post again with instagram_draft_carousel or instagram_draft_reply",
+    "superseded": "it was retired; draft the post again with instagram_draft_carousel or instagram_draft_reply",
+}
+LOCAL_REJECT_HINT = ("the local outbox, inbox or library refused this change; check the current state with "
+                     "instagram_job, instagram_inbox or instagram_jobs and adjust the arguments")
+INTERNAL_HINT = "run ghost-in-the-box doctor; for a job, inspect it with instagram_job before trying again"
+# These tools never call Instagram or a model endpoint, so their local refusals are safe to show.
+LOCAL_DETAIL_TOOLS = frozenset(item["name"] for item in TOOLS
+                               if not item["annotations"]["openWorldHint"]) - {"instagram_inspect_slide"}
+
+
+def tool_error(code, message, hint):
+    return error_object(code, message, hint, fallback_hint=INTERNAL_HINT)
+
+
+def _session_failure(account, status):
+    code = status if re.fullmatch(r"[A-Za-z_]{1,80}", status) else "session_unavailable"
+    hint = INSTALL_HINT if code == "dependency_unavailable" else (
+        "wait 30 minutes, or " + login_hint(account) if code == "auth_cooldown" else
+        "run ghost-in-the-box doctor and check the state directory permissions"
+        if code == "session_save_failed" else login_hint(account))
+    return tool_error(code, SESSION_ERRORS.get(code, "the saved Instagram session could not be used"), hint)
+
+
+def _structured_failure(result, account):
+    """Give every unsuccessful tool result the same error object, keeping its other fields."""
+    if result.get("ok") is not False:
+        return result
+    failure = result.get("failure")
+    if isinstance(failure, dict) and not isinstance(result.get("error"), dict):
+        resume = result.get("next_start_index")
+        return {**result, "error": tool_error(
+            "download_incomplete", str(failure.get("error") or "image download unavailable"),
+            "completed slides are kept; call instagram_download_media again"
+            + (f" with start_index={resume}" if resume else ""))}
+    status = result.get("status")
+    status = status if isinstance(status, str) and re.fullmatch(r"[a-z_]{1,80}", status) else "tool_failed"
+    message, hint = PUBLISH_ERRORS.get(status, (f"the tool stopped with status {status}",
+                                                "inspect the job with instagram_job"))
+    if status == "auth_unavailable":
+        hint = login_hint(account)
+    elif status == "not_queued":
+        hint = NOT_QUEUED_HINTS.get(result.get("job_status"), hint)
+    existing = result.get("error")
+    if isinstance(existing, dict):
+        # The publisher's own code and message stay; its hints name CLI commands, so
+        # an MCP client gets the matching tool instead when one exists.
+        code = existing.get("code") if isinstance(existing.get("code"), str) else status
+        message = existing.get("message") if isinstance(existing.get("message"), str) else message
+        if status not in PUBLISH_ERRORS and isinstance(existing.get("hint"), str):
+            hint = existing["hint"]
+        return {**result, "error": tool_error(code, message, hint)}
+    return {**result, "error": tool_error(status, message, hint)}
+
+
 def _tool_result(service, name, arguments):
     try:
         # Third-party diagnostics must never corrupt framing or expose secrets.
         with open(os.devnull, "w") as quiet, redirect_stdout(quiet), redirect_stderr(quiet):
             result = service.call(name, arguments)
-    except (ToolInputError, ReferenceError) as error:
-        result = {"ok": False, "error": str(error)}
+        if not isinstance(result, dict):
+            raise TypeError("tool returned a non-object result")
+        result = _structured_failure(result, service.account)
+    except ToolInputError as error:
+        result = {"ok": False, "error": tool_error(error.code, str(error), error.hint)}
+    except ReferenceError as error:
+        result = {"ok": False, "error": tool_error(
+            "reference_rejected", str(error),
+            "use an exact media_id, URL or downloaded image path returned by an earlier Instagram tool")}
     except InstagramSessionError as error:
-        status = str(error)
-        result = {"ok": False, "error": status if re.fullmatch(r"[A-Za-z_]{1,80}", status) else "session_unavailable"}
+        result = {"ok": False, "error": _session_failure(service.account, str(error))}
+    except ValueError as error:
+        code = getattr(error, "code", None)
+        if type(error).__module__.startswith("farm.") and isinstance(code, str) and str(error):
+            # Our own coded refusals (for example the outbox's) are written to be shown.
+            hint = OUTBOX_HINTS.get(code, getattr(error, "hint", None))
+            failure = tool_error(code, str(error)[:500], hint if isinstance(hint, str) else LOCAL_REJECT_HINT)
+        elif name in LOCAL_DETAIL_TOOLS and str(error):
+            failure = tool_error("rejected", str(error)[:500], LOCAL_REJECT_HINT)
+        else:
+            failure = tool_error("internal_error", "the tool failed; details are withheld so session data "
+                                 "and provider responses cannot leak", INTERNAL_HINT)
+        result = {"ok": False, "error": failure, "error_type": type(error).__name__}
     except Exception as error:
-        result = {"ok": False, "error_type": type(error).__name__}
+        result = {"ok": False, "error": tool_error(
+            "internal_error", "the tool failed; details are withheld so session data and provider responses "
+            "cannot leak", INTERNAL_HINT), "error_type": type(error).__name__}
     return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
             "isError": not result.get("ok", False)}
 
 
-def dispatch(service, message):
+INSTRUCTIONS = ("Instagram uses the configured saved session and durable outbox. "
+    "Call instagram_status first to confirm the account and session. "
+    "Use discover and references for topic research, download_media for local carousel images, "
+    "and inspect_slide to see an image through the local vision model. "
+    "Use status, own_posts, comments and inbox for account context. Draft replies or carousels, "
+    "queue the exact job, then publish_job. Never create a second draft to retry an uncertain send. "
+    "Failed calls return error.code, error.message and error.hint; follow the hint.")
+
+
+def _invalid(request_id=None, message="Invalid request"):
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32600, "message": message}}
+
+
+def dispatch(service, message, session=None):
+    """Answer one JSON-RPC message; session remembers the negotiated protocol version."""
     if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
-        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid request"}}
+        return _invalid()
     if "id" not in message:
         return None  # Notifications never execute tools and never receive replies.
     request_id = message["id"]
@@ -680,15 +956,14 @@ def dispatch(service, message):
     params = message.get("params", {})
     response = {"jsonrpc": "2.0", "id": request_id}
     if not isinstance(params, dict) or not isinstance(method, str):
-        response["error"] = {"code": -32600, "message": "Invalid request"}
+        return _invalid(request_id)
     elif method == "initialize":
-        response["result"] = {"protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {}},
-            "serverInfo": {"name": "ghost-in-the-box-instagram", "version": "1.0.0"},
-            "instructions": "Instagram uses the configured saved session and durable outbox. "
-                "Use discover and references for topic research, download_media for local carousel images, "
-                "and inspect_slide to see an image through the local vision model. "
-                "Use status, own_posts, comments and inbox for account context. Draft replies or carousels, "
-                "queue the exact job, then publish_job. Never create a second draft to retry an uncertain send."}
+        version = negotiate_protocol(params.get("protocolVersion"))
+        if session is not None:
+            session["protocol"] = version
+        response["result"] = {"protocolVersion": version, "capabilities": {"tools": {}},
+            "serverInfo": {"name": SERVER_NAME, "title": SERVER_TITLE, "version": server_version()},
+            "instructions": INSTRUCTIONS}
     elif method == "ping":
         response["result"] = {}
     elif method == "tools/list":
@@ -707,12 +982,121 @@ def dispatch(service, message):
     return response
 
 
+def handle(service, message, session):
+    """Answer one message, or a JSON-RPC batch when 2025-03-26 was negotiated."""
+    if not isinstance(message, list):
+        return dispatch(service, message, session)
+    if session.get("protocol") not in BATCH_PROTOCOL_VERSIONS or not message:
+        return _invalid()
+    replies = []
+    for item in message:
+        if isinstance(item, dict) and item.get("method") == "initialize":
+            reply = _invalid(item.get("id"), "initialize cannot be batched") if "id" in item else None
+        else:
+            reply = dispatch(service, item, session)
+        if reply is not None:
+            replies.append(reply)
+    return replies or None
+
+
+def _first_sentence(text):
+    match = re.match(r"(.+?[.!?])(?:\s|$)", " ".join(text.split()))
+    return match.group(1) if match else " ".join(text.split())
+
+
+def tool_catalog(tools=None):
+    """One-line summaries of the Instagram tools, for docs and quick inspection."""
+    entries = []
+    for item in TOOLS if tools is None else tools:
+        schema = item["inputSchema"]
+        required = list(schema.get("required", []))
+        entries.append({"name": item["name"], "title": item["title"],
+                        "description": _first_sentence(item["description"]),
+                        "required": required,
+                        "optional": [key for key in schema["properties"] if key not in required],
+                        "read_only": item["annotations"]["readOnlyHint"],
+                        "contacts_provider": item["annotations"]["openWorldHint"]})
+    return entries
+
+
+def substack_catalog(path=SUBSTACK_SERVER_SCRIPT):
+    """Read the tools this repo adds to the Substack server without importing its optional extra."""
+    try:
+        tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeError, ValueError):
+        return []
+    entries = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not any(isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute) and item.func.attr == "tool"
+                   for item in node.decorator_list):
+            continue
+        positional = [*node.args.posonlyargs, *node.args.args]
+        defaulted = len(node.args.defaults)
+        required = [arg.arg for arg in positional[:len(positional) - defaulted]]
+        required += [arg.arg for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults) if default is None]
+        optional = [arg.arg for arg in [*positional, *node.args.kwonlyargs] if arg.arg not in required]
+        entries.append({"name": node.name, "title": node.name.replace("_", " ").capitalize(),
+                        "description": _first_sentence(ast.get_docstring(node) or ""),
+                        "required": required, "optional": optional,
+                        "read_only": None, "contacts_provider": None})
+    return entries
+
+
+def catalog(substack_path=SUBSTACK_SERVER_SCRIPT):
+    servers = [{"server": SERVER_NAME, "command": "ghost-in-the-box instagram-mcp --account HANDLE",
+                "tools": tool_catalog()}]
+    substack = substack_catalog(substack_path)
+    if substack:
+        servers.append({"server": "ghost-in-the-box-substack",
+                        "command": "ghost-in-the-box substack-mcp --account HANDLE",
+                        "note": "Needs the substack extra. Also exposes the upstream python-substack tools, "
+                                "which your MCP client lists after connecting.",
+                        "tools": substack})
+    return {"generated_by": "ghost-in-the-box instagram-mcp --list-tools", "version": server_version(),
+            "protocol_versions": list(SUPPORTED_PROTOCOL_VERSIONS), "servers": servers}
+
+
+def _cell(value):
+    return " ".join(str(value).split()).replace("|", "\\|")
+
+
+def _access(entry):
+    if entry["read_only"] is None:
+        return ""
+    if entry["read_only"]:
+        return "reads the provider" if entry["contacts_provider"] else "local read"
+    return "writes; contacts the provider" if entry["contacts_provider"] else "local write"
+
+
+def catalog_markdown(data):
+    lines = ["# MCP tool catalog", "",
+             f"Generated by `ghost-in-the-box instagram-mcp --list-tools --format md` from Ghost in the Box "
+             f"{data['version']}. Supported MCP protocol versions: {', '.join(data['protocol_versions'])}.", ""]
+    for server in data["servers"]:
+        lines += [f"## {server['server']}", "", f"Start: `{server['command']}`", ""]
+        if server.get("note"):
+            lines += [server["note"], ""]
+        lines += ["| Tool | Title | What it does | Required | Optional | Access |",
+                  "|---|---|---|---|---|---|"]
+        for entry in server["tools"]:
+            lines.append("| " + " | ".join([
+                f"`{entry['name']}`", _cell(entry["title"]), _cell(entry["description"]),
+                ", ".join(f"`{name}`" for name in entry["required"]),
+                ", ".join(f"`{name}`" for name in entry["optional"]), _access(entry)]) + " |")
+        lines.append("")
+    return "\n".join(lines).rstrip("\n")
+
+
 def read_message(stream):
-    """Accept Batbox framing and newline JSON; respond in the caller's format."""
+    """Accept MCP newline JSON and Content-Length frames; respond in the caller's format."""
     line = stream.readline(8193)
+    while line and not line.strip():
+        line = stream.readline(8193)
     if not line:
         return None, "framed"
-    if line.lstrip().startswith(b"{"):
+    if line.lstrip().startswith((b"{", b"[")):
         if not line.endswith(b"\n"):
             tail = stream.readline(MAX_MESSAGE_BYTES - len(line) + 1)
             line += tail
@@ -754,18 +1138,20 @@ def write_message(stream, message, framing="framed"):
 def serve(service, stdin=None, stdout=None):
     stdin = stdin or sys.stdin.buffer
     stdout = stdout or sys.stdout.buffer
+    session = {}
+    framing = "framed"
     while True:
         try:
             message, framing = read_message(stdin)
         except (ValueError, UnicodeError):
             # Invalid framing cannot safely be resynchronized. No raw payloads.
             write_message(stdout, {"jsonrpc": "2.0", "id": None,
-                "error": {"code": -32700, "message": "Invalid JSON-RPC message"}})
+                "error": {"code": -32700, "message": "Invalid JSON-RPC message"}}, framing)
             return 2
         if message is None:
             return 0
         if isinstance(message, dict) and message.get("method") == "notifications/exit" and "id" not in message:
             return 0
-        response = dispatch(service, message)
+        response = handle(service, message, session)
         if response is not None:
             write_message(stdout, response, framing)

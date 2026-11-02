@@ -1,4 +1,6 @@
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+import io
 import json
 import os
 from pathlib import Path
@@ -10,10 +12,13 @@ from unittest.mock import Mock, patch
 from farm.inbox import Inbox
 from farm.outbox import Outbox
 from farm.threads_notifications import namespace, sync_threads
+from farm.threads_transport import ThreadsDependencyUnavailable
+from scripts import threads_notifications as notifications
 from scripts.threads_notifications import notify_agent, quiet_window
+from _env import IsolatedStateTestCase
 
 
-class ThreadsNotificationTests(unittest.TestCase):
+class ThreadsNotificationTests(IsolatedStateTestCase):
     def test_eastern_quiet_window_skips_browser_refresh(self):
         self.assertEqual(quiet_window(datetime(2026,10,26,9,59,tzinfo=timezone.utc))
                          ["status"],"quiet_hours")
@@ -139,6 +144,86 @@ class ThreadsNotificationTests(unittest.TestCase):
             self.assertEqual(result["message_id"], batch["id"])
             self.assertIsNone(batch["sent_at"])
             runner.assert_not_called()
+
+
+
+class NotificationCliTests(IsolatedStateTestCase):
+    def setUp(self):
+        super().setUp()
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        environment = patch.dict(os.environ, {
+            "SOCIAL_FARM_OUTBOX_DB": str(self.root / "outbox.sqlite3"),
+            "SOCIAL_FARM_ACCOUNTS_FILE": str(self.root / "accounts.json")})
+        environment.start()
+        self.addCleanup(environment.stop)
+        inbox_path = self.root / "inbox.sqlite3"
+        self.inbox_patch = patch.object(notifications, "Inbox", side_effect=lambda: Inbox(inbox_path))
+        self.inbox_patch.start()
+        self.addCleanup(self.inbox_patch.stop)
+        inbox = Inbox(inbox_path)
+        try:
+            for comment_id in ("789", "790", "791"):
+                inbox.save_external_comment(
+                    account="threads:mine", comment_id=comment_id, media_id="123",
+                    parent_id="123", url=f"https://www.threads.com/@reader/post/R{comment_id}",
+                    media_url="https://www.threads.com/@mine/post/P123", author="reader",
+                    body="A question?", timestamp="2026-10-26T12:00:00+00:00")
+            inbox.unseen("threads:mine", worker="helper")
+        finally:
+            inbox.close()
+
+    def run_cli(self, argv, stdin=""):
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(notifications.sys, "stdin", io.StringIO(stdin)), \
+                redirect_stdout(output), redirect_stderr(errors):
+            try:
+                code = notifications.main(argv)
+            except SystemExit as stop:
+                return stop.code, None
+        return code, json.loads(output.getvalue())
+
+    def test_account_is_required_instead_of_a_placeholder(self):
+        code, _ = self.run_cli(["peek"])
+        self.assertEqual(code, 2)
+
+    def test_draft_reply_accepts_inline_file_or_stdin_body(self):
+        body_file = self.root / "reply.txt"
+        body_file.write_text("From a file.", encoding="utf-8")
+        cases = (("789", ["--body", "Inline."], "", "Inline."),
+                 ("790", ["--body-file", str(body_file)], "", "From a file."),
+                 ("791", ["--body-file", "-"], "From stdin.", "From stdin."))
+        for comment_id, extra, stdin, expected in cases:
+            with self.subTest(extra=extra):
+                code, result = self.run_cli(["--account", "mine", "draft-reply", "--comment-id",
+                                             comment_id, "--worker", "helper", *extra], stdin)
+                self.assertEqual(code, 0)
+                with Outbox() as box:
+                    self.assertEqual(box.get(result["result"]["id"])["body"], expected)
+
+    def test_draft_reply_errors_use_the_envelope(self):
+        code, result = self.run_cli(["--account", "mine", "draft-reply", "--comment-id", "789",
+                                     "--worker", "helper", "--body", "x" * 501])
+        self.assertEqual((code, result["status"]), (2, "text_must_contain_1_to_500_characters"))
+        self.assertEqual(set(result["error"]), {"code", "message", "hint"})
+        code, result = self.run_cli(["--account", "mine", "draft-reply", "--comment-id", "789",
+                                     "--worker", "someone-else", "--body", "Hi."])
+        self.assertEqual((code, result["error"]["code"]), (2, "inbox_comment_not_claimed_by_worker"))
+        self.assertEqual(result["error_type"], "ValueError")
+        code, _ = self.run_cli(["--account", "mine", "draft-reply", "--comment-id", "789",
+                                "--worker", "helper"])
+        self.assertEqual(code, 2)
+
+    def test_missing_browser_dependency_names_the_install_command(self):
+        reader = Mock()
+        reader.own_posts.side_effect = ThreadsDependencyUnavailable("playwright", "pip install x")
+        with patch.object(notifications, "ThreadsReader", return_value=reader), \
+                patch.object(notifications, "quiet_window", return_value=None):
+            code, result = self.run_cli(["--account", "mine", "sync"])
+        self.assertEqual(code, 4)
+        self.assertEqual((result["status"], result["error"]["hint"]),
+                         ("dependency_unavailable", "pip install x"))
 
 
 if __name__ == "__main__":

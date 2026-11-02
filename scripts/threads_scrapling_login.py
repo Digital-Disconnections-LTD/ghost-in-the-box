@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
-import fcntl
 import json
 import logging
 import os
@@ -24,11 +23,16 @@ import time
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from farm import locking as fcntl
 from farm.config import STATE_ROOT
+from farm.config import credentials_path
+from farm.threads_auth import ThreadsAuthError, read_verification_code
+from farm.cli_output import EXIT_AUTH, EXIT_RUNTIME, EXIT_USAGE, attach_error, guarded
+from farm.threads_transport import scrapling_install
 
 BASE = STATE_ROOT / 'threads-scrapling'
 BROWSER_BASE = STATE_ROOT / 'threads-browser-fallback'
-CREDS = Path.home() / ".batbox/social-farm-creds/ig.json"
+CREDS = credentials_path()
 IG_SESSIONS = STATE_ROOT / 'ig'
 URL = "https://www.threads.com"
 BRIDGE = Path(__file__).with_name("threads_scrapling_cookie_bridge.mjs")
@@ -48,6 +52,33 @@ CHOICE = ['button:has-text("Log in with Instagram")',
 
 class LocalInputsInvalid(Exception):
     pass
+
+
+_RELOGIN = ("ghost-in-the-box login start --platform threads --account {account}, "
+            "or ghost-in-the-box threads --account {account} connect --refresh")
+ERRORS = {
+    "local_inputs_invalid": (EXIT_USAGE, "The account, credentials file or saved Instagram "
+                             "session is missing, not private or does not match.",
+                             "Check --account and that the session files are chmod 600."),
+    "dependency_unavailable": (EXIT_AUTH, "{dependency} is not installed.", "{install}"),
+    "browser_setup_required": (EXIT_AUTH, "The Node browser transport is not set up.",
+                               "ghost-in-the-box threads-setup --account {account}"),
+    "verification_expired": (EXIT_AUTH, "The verified browser login is older than 15 minutes.",
+                             "Run the login again, then transfer."),
+    "linked_account_unavailable": (EXIT_AUTH, "Threads did not offer the linked Instagram "
+                                   "account.", _RELOGIN),
+    "identity_unverified": (EXIT_AUTH, "The browser could not confirm it is signed in as "
+                            "@{account}.", _RELOGIN),
+    "two_factor_required": (EXIT_AUTH, "Threads asked for an authenticator code.",
+                            "Re-run with --mode login --verification-code-stdin."),
+    "code_rejected": (EXIT_AUTH, "The authenticator code was rejected.",
+                      "Wait for a new code and re-run once."),
+    "checkpoint_required": (EXIT_AUTH, "Threads requires a security checkpoint.",
+                            "Finish the checkpoint in the Threads or Instagram app, then retry."),
+    "login_rejected": (EXIT_AUTH, "Threads rejected the login.", _RELOGIN),
+    "profile_busy": (EXIT_RUNTIME, "Another command is using this browser profile.",
+                     "Wait for it to finish, then retry."),
+}
 
 
 def private_dir(path: Path) -> Path:
@@ -82,9 +113,10 @@ def save_json(path: Path, data: dict) -> None:
 
 @contextmanager
 def lock(path: Path):
-    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
         # Fail promptly instead of waiting behind a forgotten browser process.
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         yield
@@ -93,12 +125,11 @@ def lock(path: Path):
 
 
 def read_code() -> str:
-    # Reuse the echo-disabled reader; called only after a visible OTP challenge.
+    # Called only after a visible OTP challenge; a bad code is a local input error.
     try:
-        from scripts.threads_browser_login import _read_code
-    except ModuleNotFoundError:
-        from threads_browser_login import _read_code
-    return _read_code()
+        return read_verification_code()
+    except ThreadsAuthError:
+        raise ValueError("invalid_code_format") from None
 
 
 def trusted(page) -> bool:
@@ -192,18 +223,22 @@ def submit(page, *, code=False) -> bool:
     return True
 
 
+# Handles in the signed-in Profile link; the login wizard reads the same link.
+PROFILE_HANDLES = """() => Array.from(document.querySelectorAll('a[href^="/@"]'))
+      .filter(a => /^(?:profile|your profile)$/i.test(a.getAttribute('aria-label') || '') ||
+        Array.from(a.querySelectorAll('[aria-label]')).some(n =>
+          /^(?:profile|your profile)$/i.test(n.getAttribute('aria-label') || '')))
+      .map(a => a.getAttribute('href').match(/^\\/@([A-Za-z0-9._]+)\\/?$/)?.[1])
+      .filter(Boolean)"""
+
+
 def verify_identity(page, account: str) -> tuple[bool, list]:
     """Require the signed-in Profile link and matching embedded account ID."""
     page.goto(URL + "/", wait_until="domcontentloaded", timeout=45000)
     page.wait_for_timeout(2200)
     if not trusted(page) or inspect_page(page)["form_stage"] != "page":
         return False, []
-    handles = page.evaluate("""() => Array.from(document.querySelectorAll('a[href^="/@"]'))
-      .filter(a => /^(?:profile|your profile)$/i.test(a.getAttribute('aria-label') || '') ||
-        Array.from(a.querySelectorAll('[aria-label]')).some(n =>
-          /^(?:profile|your profile)$/i.test(n.getAttribute('aria-label') || '')))
-      .map(a => a.getAttribute('href').match(/^\\/@([A-Za-z0-9._]+)\\/?$/)?.[1])
-      .filter(Boolean)""")
+    handles = page.evaluate(PROFILE_HANDLES)
     if not handles or set(h.casefold() for h in handles) != {account.casefold()}:
         return False, []
     cookies = page.context.cookies([URL, "https://www.instagram.com"])
@@ -276,7 +311,6 @@ def browser_run(args, profile: Path, account_dir: Path, *, factory=None) -> dict
         (account_dir / "verified-cookies.json").unlink(missing_ok=True)
 
     def action(page):
-        nonlocal result
         try:
             if args.mode == "linked":
                 page.context.add_cookies(linked_instagram_cookies(args.account))
@@ -374,7 +408,12 @@ def browser_run(args, profile: Path, account_dir: Path, *, factory=None) -> dict
                 result["screenshot_saved"] = screenshot_private(page, account_dir / "diagnostic.png")
 
     if factory is None:
-        from scrapling.fetchers import StealthySession
+        try:
+            from scrapling.fetchers import StealthySession
+        except ImportError:
+            return {"ok": False, "status": "dependency_unavailable", "needs_code": False,
+                    "dependency": "scrapling",
+                    "install": scrapling_install(sys.executable)}
         factory = StealthySession
     # No automatic retries: one invocation can submit credentials once only.
     with factory(user_data_dir=str(profile), headless=not args.headed,
@@ -445,9 +484,10 @@ def copy_profile(source: Path, target: Path) -> None:
                     ignore=shutil.ignore_patterns("Singleton*", "DevToolsActivePort"))
 
 
+@guarded("threads")
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--account", default="example_creator")
+    parser.add_argument("--account", required=True, help="your Threads handle")
     parser.add_argument("--mode", choices=("diagnose", "login", "linked", "transfer"), default="diagnose")
     parser.add_argument("--verification-code-stdin", action="store_true")
     parser.add_argument("--headed", action="store_true", help="Requires DISPLAY (or xvfb-run).")
@@ -497,8 +537,9 @@ def main(argv=None) -> int:
         result = {"ok": False, "status": "profile_busy", "needs_code": False}
     except Exception:
         result = {"ok": False, "status": "browser_unavailable", "needs_code": False}
+    code = attach_error(result, ERRORS, account=args.account)
     print(json.dumps(result))
-    return 0 if result["ok"] else 2
+    return code
 
 
 if __name__ == "__main__":

@@ -8,8 +8,12 @@ import json
 import os
 import signal
 import subprocess
+from pathlib import Path
 import sys
 import threading
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from farm.cli_output import EXIT_RUNTIME, EXIT_USAGE, emit, failure
 
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 
@@ -57,16 +61,30 @@ def write_message(stream, payload: bytes, mode: str):
     stream.flush()
 
 
+def _bridge_failure(code, message, hint, exit_code):
+    # stdout carries the MCP protocol, so the envelope goes to stderr.
+    print(f"mcp-bridge: {message}\nhint: {hint}", file=sys.stderr)
+    emit(failure(code, message, hint), stream=sys.stderr)
+    return exit_code
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs=argparse.REMAINDER,
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Example: ghost-in-the-box mcp-bridge -- ghost-in-the-box instagram-mcp --account YOUR_HANDLE")
+    parser.add_argument("command", nargs=argparse.REMAINDER, metavar="-- COMMAND [ARGS...]",
                         help="server executable and arguments, after --")
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("provide an MCP server command after --")
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=sys.stderr, start_new_session=os.name == "posix")
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=sys.stderr, start_new_session=os.name == "posix")
+    except OSError as error:
+        return _bridge_failure("server_not_started", f"could not start {command[0]} ({type(error).__name__})",
+                               "check the server command and its path, e.g. ghost-in-the-box mcp-bridge -- "
+                               "ghost-in-the-box instagram-mcp --account YOUR_HANDLE", EXIT_USAGE)
     mode = ["framed"]
     ready = threading.Event()
     failures = []
@@ -134,8 +152,9 @@ def main(argv=None):
         if outgoing.is_alive():
             failures.append("output did not finish")
         if failures:
-            print("MCP bridge stopped: invalid or interrupted transport", file=sys.stderr)
-            return 2
+            return _bridge_failure("transport_failed", "MCP bridge stopped: invalid or interrupted transport",
+                                   "check that the server speaks newline-delimited JSON-RPC on stdout",
+                                   EXIT_RUNTIME)
         return result
     except KeyboardInterrupt:
         stop()

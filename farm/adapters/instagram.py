@@ -11,23 +11,44 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
-import fcntl
+from farm import locking as fcntl
 
 from farm.accounts import AccountRegistry
+from farm.adapters import (
+    AuthUnavailable, DependencyUnavailable, PreSendFailure, PublishRejected, PublishUncertain,
+    definite_rejection, request_never_sent,
+)
+from farm.config import install_command
 from farm.outbox import file_sha256, frozen_payload_matches
 from farm.instagram_session import InstagramSessionError, read_with_session
 
 
-class PreSendFailure(Exception):
-    """No public publish call was attempted."""
+__all__ = [
+    "AuthUnavailable", "DependencyUnavailable", "InstagramAdapter", "PreSendFailure",
+    "PublishRejected", "PublishUncertain",
+]
+
+INSTALL_HINT = install_command("instagram")
+# instagrapi raises these before or instead of applying a request when the
+# saved login is refused or throttled.
+AUTH_ERRORS = frozenset({
+    "LoginRequired", "ClientLoginRequired", "ChallengeRequired", "ClientUnauthorizedError",
+    "ClientForbiddenError", "ClientThrottledError", "PleaseWaitFewMinutes", "FeedbackRequired",
+    "RateLimitError", "TwoFactorRequired",
+})
+# Private instagrapi 2.18.20 members the single-write guard depends on.
+RETRY_GUARD_ATTRIBUTES = ("_configure_private_session_retry", "_send_private_request",
+                          "private_request", "session_retry_total")
 
 
-class AuthUnavailable(PreSendFailure):
-    """Saved Instagram auth could not be used; keep the queued job."""
+class _WriteLedger:
+    """Count data-bearing private requests made during one publish."""
 
-
-class PublishUncertain(Exception):
-    """A publish call began; provider state needs reconciliation."""
+    def __init__(self):
+        self.sent = 0
+        self.completed = 0
+        self.rejected = 0
+        self.last_status: int | None = None
 
 
 class InstagramAdapter:
@@ -39,6 +60,7 @@ class InstagramAdapter:
         self.client = None
         self.session_path: Path | None = None
         self.session_mtime_ns: int | None = None
+        self.writes = _WriteLedger()
 
     def _new_client(self):
         if self.client_factory is not None:
@@ -59,7 +81,8 @@ class InstagramAdapter:
         try:
             client = self._new_client()
         except ImportError as exc:
-            raise AuthUnavailable("Instagram client dependency unavailable") from exc
+            raise DependencyUnavailable("Instagram client dependency unavailable",
+                                        install_hint=INSTALL_HINT) from exc
         session = Path(entry["session_file"])
         try:
             client.load_settings(session)
@@ -97,12 +120,16 @@ class InstagramAdapter:
     def _single_write_attempt(self) -> None:
         """Disable the installed client's implicit replay of ambiguous POSTs."""
         client = self.client
-        if hasattr(client, '_configure_private_session_retry'):
-            client.session_retry_total = 0
-            client._configure_private_session_retry()
-        if not hasattr(client, '_send_private_request') or not hasattr(client, 'private_request'):
-            return
+        missing = [name for name in RETRY_GUARD_ATTRIBUTES if not hasattr(client, name)]
+        if missing:
+            # Without these members instagrapi would silently retry an ambiguous
+            # POST, which can publish twice. Refuse to send rather than guess.
+            raise PreSendFailure("installed instagrapi lacks the single-write guard ("
+                                 + ", ".join(missing) + "); reinstall instagrapi 2.18.20")
+        client.session_retry_total = 0
+        client._configure_private_session_retry()
         normal_request = client.private_request
+        ledger = self.writes
 
         def once(endpoint, data=None, params=None, login=False, with_signature=True,
                  headers=None, extra_sig=None, domain=None):
@@ -113,16 +140,47 @@ class InstagramAdapter:
             request_headers = dict(headers or {})
             if getattr(client, 'authorization', None) and 'authorization' not in request_headers:
                 request_headers['Authorization'] = client.authorization
-            client.private_requests_count += 1
-            return client._send_private_request(endpoint, data=data, params=params,
-                login=login, with_signature=with_signature, headers=request_headers,
-                extra_sig=extra_sig, domain=domain)
+            client.private_requests_count = getattr(client, 'private_requests_count', 0) + 1
+            ledger.sent += 1
+            try:
+                result = client._send_private_request(endpoint, data=data, params=params,
+                    login=login, with_signature=with_signature, headers=request_headers,
+                    extra_sig=extra_sig, domain=domain)
+            except Exception as exc:
+                # instagrapi resets last_response per request, so a value here
+                # belongs to this write.
+                status = getattr(getattr(client, 'last_response', None), 'status_code', None)
+                if status is None and request_never_sent(exc):
+                    ledger.sent -= 1
+                elif definite_rejection(status):
+                    ledger.rejected += 1
+                    ledger.last_status = status
+                raise
+            ledger.completed += 1
+            return result
 
         client.private_request = once
 
-    def publish(self, job: dict) -> dict:
+    def _send_failure(self, exc: Exception) -> Exception:
+        """Classify an exception raised while the client was publishing."""
+        ledger = self.writes
+        name = type(exc).__name__
+        if ledger.sent == 0:
+            # instagrapi 2.18.20 uploads media bytes to a private rupload
+            # endpoint and makes them public only through a data-bearing
+            # private_request (configure or comment), which the ledger counts.
+            if name in AUTH_ERRORS:
+                return AuthUnavailable(f"Instagram refused the saved session before the write ({name})")
+            return PreSendFailure(f"Instagram stopped before any public write ({name})")
+        if ledger.rejected == ledger.sent:
+            return PublishRejected(f"Instagram rejected the write with HTTP {ledger.last_status} ({name})",
+                                   status_code=ledger.last_status)
+        return PublishUncertain(name)
+
+    def publish(self, job: dict, *, before_send=None) -> dict:
         snapshot_dir = None
         send_started = False
+        self.writes = _WriteLedger()
         try:
             media = None
             if job['action'] == 'post' and job.get('media_path'):
@@ -168,6 +226,8 @@ class InstagramAdapter:
             self._prepare(job)
             self._single_write_attempt()
             client = self.client
+            if before_send is not None:
+                before_send()
             if job["action"] == "reply":
                 send_started = True
                 try:
@@ -176,7 +236,7 @@ class InstagramAdapter:
                     replied_to_comment_id=int(job["target_id"]),
                     )
                 except Exception as exc:
-                    raise PublishUncertain(type(exc).__name__) from exc
+                    raise self._send_failure(exc) from exc
                 provider_id = str(result.pk)
                 base = str(job.get("target_url") or "").split("?")[0].rstrip("/")
                 permalink = f"{base}/?comment_id={provider_id}" if base else None
@@ -189,7 +249,7 @@ class InstagramAdapter:
                         share_to_threads=bool(job.get("crosspost_threads")),
                     )
                 except Exception as exc:
-                    raise PublishUncertain(type(exc).__name__) from exc
+                    raise self._send_failure(exc) from exc
                 surface = "p"
             elif media.suffix.lower() in (".jpg", ".jpeg"):
                 send_started = True
@@ -199,7 +259,7 @@ class InstagramAdapter:
                         share_to_threads=bool(job.get("crosspost_threads")),
                     )
                 except Exception as exc:
-                    raise PublishUncertain(type(exc).__name__) from exc
+                    raise self._send_failure(exc) from exc
                 surface = "p"
             else:
                 send_started = True
@@ -209,7 +269,7 @@ class InstagramAdapter:
                         share_to_threads=bool(job.get("crosspost_threads")),
                     )
                 except Exception as exc:
-                    raise PublishUncertain(type(exc).__name__) from exc
+                    raise self._send_failure(exc) from exc
                 surface = "reel"
             provider_id = str(result.pk)
             code = getattr(result, "code", None)
@@ -219,6 +279,7 @@ class InstagramAdapter:
             raise
         except Exception as exc:
             if send_started:
+                # The provider returned, so its answer is the only unread part.
                 raise PublishUncertain(type(exc).__name__) from exc
             raise PreSendFailure(type(exc).__name__) from exc
         finally:

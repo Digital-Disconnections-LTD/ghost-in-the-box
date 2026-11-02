@@ -4,6 +4,8 @@ import json
 from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import os
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 import unittest
 
@@ -11,6 +13,7 @@ from farm.outbox import Outbox
 from farm.adapters.threads import AuthUnavailable
 from farm.threads_cadence import ThreadsCadence, in_quiet_hours
 from scripts.threads_publish_once import run
+from _env import IsolatedStateTestCase
 
 
 NY = ZoneInfo("America/New_York")
@@ -35,7 +38,7 @@ class FakeAdapter:
         return {"provider_id": "999", "permalink": "https://www.threads.com/@mine/post/abc"}
 
 
-class ThreadsCadenceTests(unittest.TestCase):
+class ThreadsCadenceTests(IsolatedStateTestCase):
     def test_new_york_quiet_boundaries_across_dst(self):
         for day in ("2026-03-08", "2026-11-01", "2026-10-26"):
             with self.subTest(day=day):
@@ -191,6 +194,23 @@ class ThreadsCadenceTests(unittest.TestCase):
             self.assertEqual(invoke(start + timedelta(minutes=30), successful)[1]["status"],
                              "published")
             self.assertEqual(len(successful.sent), 1)
+
+
+
+class CadenceWindowsTests(IsolatedStateTestCase):
+    def test_lock_and_write_work_without_fchmod_and_ignore_mode_bits_on_windows(self):
+        with TemporaryDirectory() as folder:
+            cadence = ThreadsCadence("mine", directory=Path(folder), rng=FixedRng(3600))
+            saved = os.fchmod
+            del os.fchmod
+            try:
+                with cadence.locked():
+                    cadence.record_post_attempt(datetime(2026, 10, 26, 12, tzinfo=timezone.utc))
+            finally:
+                os.fchmod = saved
+            cadence.path.chmod(0o644)
+            with patch("farm.threads_cadence.os.name", "nt"), cadence.locked():
+                self.assertIsNotNone(cadence._read())
 
 
 if __name__ == "__main__":

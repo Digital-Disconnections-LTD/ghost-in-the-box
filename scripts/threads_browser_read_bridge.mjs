@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 // Bounded Threads browser reads. Provider bodies and cookies stay in process.
-import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -8,8 +7,10 @@ const output = process.stdout.write.bind(process.stdout);
 console.log = () => {};
 console.warn = () => {};
 console.error = () => {};
-const base = process.env.SOCIAL_FARM_THREADS_MCP_SOURCE ||
-  path.join(os.homedir(), '.batbox/social-farm-state/threads-browser-fallback/source');
+// The Python caller owns the state directory and passes the pinned source path.
+const sourceFlag = process.argv.indexOf('--source');
+const base = (sourceFlag > -1 ? process.argv[sourceFlag + 1] : '') ||
+  process.env.SOCIAL_FARM_THREADS_MCP_SOURCE || '';
 let closeContext;
 
 function emit(status, more = {}) {
@@ -20,6 +21,10 @@ async function main() {
   let raw = '';
   for await (const part of process.stdin) raw += part;
   const request = JSON.parse(raw);
+  if (!base || !path.isAbsolute(base)) {
+    emit('bridge_unavailable');
+    return;
+  }
   if (!/^[A-Za-z0-9._]+$/.test(request.account) ||
       !['me', 'own', 'replies'].includes(request.operation) ||
       !Number.isInteger(request.limit) || request.limit < 1 || request.limit > 25) {

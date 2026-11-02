@@ -14,9 +14,13 @@ from types import SimpleNamespace
 
 import requests
 
-from farm.accounts import AccountRegistry
+from farm.accounts import AccountRegistry, account_key_matches
+from farm.adapters import (
+    AuthUnavailable, DependencyUnavailable, PreSendFailure, PublishRejected, PublishUncertain,
+    ReadFailure, definite_rejection, request_never_sent,
+)
 from farm.outbox import frozen_payload_matches
-from farm.threads_auth import DEFAULT_AUTH_DIR, ThreadsAuthError, load_token
+from farm.threads_auth import DEFAULT_AUTH_DIR, ThreadsAuthError, load_token, verify_bearer_identity
 
 
 READ_BASE = "https://www.threads.com"
@@ -24,20 +28,14 @@ WRITE_BASE = "https://i.instagram.com"
 APP_ID = "238260118697367"
 
 
-class ThreadsReadFailure(Exception):
+class ThreadsReadFailure(ReadFailure):
     """A bounded Threads read failed; response bodies are kept private."""
 
 
-class PreSendFailure(Exception):
-    """No public Threads publish call was attempted."""
-
-
-class AuthUnavailable(PreSendFailure):
-    """Account auth is temporarily unavailable; the queued job can wait."""
-
-
-class PublishUncertain(Exception):
-    """A Threads publish call began; reconcile before any retry."""
+__all__ = [
+    "AuthUnavailable", "DependencyUnavailable", "PreSendFailure", "PublishRejected",
+    "PublishUncertain", "ThreadsAdapter", "ThreadsReadFailure",
+]
 
 
 def _post(item: dict) -> dict:
@@ -75,6 +73,9 @@ def _flatten(threads: list, limit: int) -> list[dict]:
 
 
 class ThreadsAdapter:
+    # The mobile publisher asks Threads who the bearer belongs to before every send.
+    LIVE_IDENTITY_CHECK = True
+
     def __init__(self, registry: AccountRegistry | None = None, http=None,
                  client_factory=None, auth_dir: Path = DEFAULT_AUTH_DIR):
         self.registry = registry or AccountRegistry()
@@ -89,7 +90,7 @@ class ThreadsAdapter:
             raise ThreadsReadFailure("Threads and Instagram account registrations are required")
         if (threads["kind"] != "instagrapi_settings" or
                 instagram["kind"] != "instagrapi_settings" or
-                threads["account_key"] != instagram["account_key"] or
+                not account_key_matches(instagram, threads["account_key"]) or
                 threads["session_file"] != instagram["session_file"]):
             raise ThreadsReadFailure("Threads registration must share the Instagram session and account key")
         if not threads["session_exists"] or not threads["session_private"]:
@@ -203,7 +204,11 @@ class ThreadsAdapter:
             raise PreSendFailure("Threads reply needs matching numeric media_id and target_id")
         registration = self.registry.status("threads", job["account"])
         instagram = self.registry.status("instagram", job["account"])
-        if not registration or not instagram or job.get("account_key") != registration["account_key"]:
+        if registration and registration["kind"] == "cookie_jar":
+            raise AuthUnavailable("portable browser session selected")
+        if not registration:
+            raise AuthUnavailable("Threads account is not registered")
+        if not instagram or not account_key_matches(registration, job.get("account_key")):
             raise PreSendFailure("Threads job account key does not match registration")
         try:
             settings = self._settings(job["account"])
@@ -236,6 +241,16 @@ class ThreadsAdapter:
                 raise AuthUnavailable("Threads bearer session unavailable")
             if not isinstance(probe_data, dict) or probe_data.get("status") == "fail":
                 raise PreSendFailure("Threads bearer preflight returned failure")
+            # Local files only prove the token matches the session file; a copied
+            # token for another account would pass them, so the server decides.
+            try:
+                verify_bearer_identity(token, http=self.http, headers=headers)
+            except ThreadsAuthError as exc:
+                if exc.status == "identity_mismatch":
+                    raise PreSendFailure("Threads bearer belongs to a different account") from exc
+                if exc.status == "rate_limited":
+                    raise AuthUnavailable("Threads identity check returned HTTP 429") from exc
+                raise AuthUnavailable(f"Threads identity check failed ({exc.status})") from exc
             return identity, client, headers
         except PreSendFailure:
             raise
@@ -272,10 +287,19 @@ class ThreadsAdapter:
                 headers={**headers, "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
                 timeout=20, allow_redirects=False,
             )
+        except Exception as exc:
+            if request_never_sent(exc):
+                raise PreSendFailure(
+                    f"Threads configure request never left this machine ({type(exc).__name__})") from exc
+            raise PublishUncertain(f"Threads configure outcome unknown ({type(exc).__name__})") from exc
+        try:
+            if definite_rejection(response.status_code):
+                raise PublishRejected(f"Threads configure rejected with HTTP {response.status_code}",
+                                      status_code=response.status_code)
             if response.status_code != 200:
                 raise PublishUncertain(f"Threads configure returned HTTP {response.status_code}")
             result = response.json()
-            if result.get("status") != "ok":
+            if not isinstance(result, dict) or result.get("status") != "ok":
                 raise PublishUncertain("Threads configure did not confirm success")
             media = result.get("media") or {}
             provider_id = str(media.get("pk") or media.get("id") or "")
@@ -286,7 +310,7 @@ class ThreadsAdapter:
             username = user.get("username") or job["account"]
             permalink = f"{READ_BASE}/@{username}/post/{code}" if code else None
             return {"provider_id": provider_id, "permalink": permalink}
-        except PublishUncertain:
+        except (PublishRejected, PublishUncertain):
             raise
         except Exception as exc:
-            raise PublishUncertain(f"Threads configure outcome unknown ({type(exc).__name__})") from exc
+            raise PublishUncertain(f"Threads configure answer unreadable ({type(exc).__name__})") from exc

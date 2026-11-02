@@ -1,5 +1,5 @@
 {
-  "account": "example_creator",
+  "account": "YOUR_SUBSTACK_HANDLE",
   "publication_url": "https://YOUR-PUBLICATION.substack.com",
   "cookies_path": "/absolute/private/substack-cookies.json",
   "timezone": "UTC",

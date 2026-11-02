@@ -256,11 +256,21 @@ class Inbox:
                 raise ValueError('comment not held by this worker')
 
     def mark_seen(self, account, comment_id):
+        """Claim one comment for the operator; returns False if it was not claimable.
+
+        Only unreviewed comments and reviews whose claim expired move. A drafted
+        or skipped comment, or one another worker holds, stays as it is.
+        """
         with self.db:
             now = datetime.now(timezone.utc)
-            self.db.execute("""UPDATE comments SET seen=1,response_state='reviewing',
-                read_at=?,claimed_by='operator',claim_until=? WHERE account=? AND comment_id=?""",
-                (now.isoformat(),(now+timedelta(hours=1)).isoformat(),account,str(comment_id)))
+            cursor = self.db.execute("""UPDATE comments SET seen=1,response_state='reviewing',
+                read_at=?,claimed_by='operator',claim_until=?
+                WHERE account=? AND comment_id=? AND (
+                    response_state IS NULL OR response_state='unreviewed' OR
+                    (response_state='reviewing' AND (claim_until IS NULL OR claim_until<?)))""",
+                (now.isoformat(),(now+timedelta(hours=1)).isoformat(),account,str(comment_id),
+                 now.isoformat()))
+            return cursor.rowcount == 1
 
     def draft_reply(self, outbox, account, comment_id, body, *, worker=None,
                     platform='instagram', profile_account=None):

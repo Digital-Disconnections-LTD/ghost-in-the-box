@@ -21,3 +21,7 @@ campaigns/
 *.db-*
 cookies*.json
 *.session
+*.ghostbox-sessions.json
+
+# Local notes with third-party client IDs and keys
+REFERENCE.md

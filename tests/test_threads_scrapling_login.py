@@ -2,7 +2,6 @@ from contextlib import redirect_stdout
 import argparse
 import io
 import json
-import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -235,6 +234,26 @@ class ScraplingLoginTests(unittest.TestCase):
             self.assertEqual(login.main(["--account", "mine", "--mode", "linked"]), 0)
         self.assertTrue((self.profile / "fresh").is_file())
         self.assertFalse((self.profile / "stale").exists())
+
+
+
+class ScraplingLoginCliTests(unittest.TestCase):
+    def test_account_is_required(self):
+        with patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as stop:
+            login.main([])
+        self.assertEqual(stop.exception.code, 2)
+
+    def test_bad_account_gets_usage_exit_and_envelope(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = login.main(["--account", "../x"])
+        result = json.loads(output.getvalue())
+        self.assertEqual((code, result["status"]), (2, "local_inputs_invalid"))
+        self.assertEqual(result["error"]["code"], "local_inputs_invalid")
+
+    def test_invalid_challenge_code_is_a_local_input_error(self):
+        with patch("sys.stdin", io.StringIO("12\n")), self.assertRaises(ValueError):
+            login.read_code()
 
 
 if __name__ == "__main__":

@@ -21,7 +21,30 @@ class PublicSetupTests(unittest.TestCase):
                     redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(ig_probe.main(), 2)
             client.assert_not_called()
-            self.assertEqual(json.loads(output.getvalue())["error"], "private_credentials_unavailable")
+            result = json.loads(output.getvalue())
+            self.assertEqual(result["error"]["code"], "private_credentials_unavailable")
+            self.assertEqual(result["error"]["hint"], result["hint"])
+            self.assertEqual(result["credentials_path"], str(path))
+            self.assertIn("chmod 600", result["hint"])
+
+    def test_missing_instagram_credentials_name_the_path_and_the_wizard(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "absent.json"
+            with patch("sys.argv", ["login", "--credentials", str(path)]), \
+                    patch.object(ig_probe, "Client") as client, \
+                    redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(ig_probe.main(), 2)
+            client.assert_not_called()
+            result = json.loads(output.getvalue())
+            self.assertEqual(result["error"]["code"], "private_credentials_unavailable")
+            self.assertEqual(result["error"]["hint"], result["hint"])
+            self.assertIn(str(path), result["message"])
+            self.assertIn("ghost-in-the-box login start --platform instagram", result["hint"])
+
+    def test_default_credentials_and_sessions_come_from_config(self):
+        from farm import config
+        self.assertEqual(ig_probe.CREDENTIALS, config.credentials_path())
+        self.assertEqual(ig_probe.STATE_DIR, config.instagram_sessions_dir())
 
     def test_instagram_rejects_unsafe_account_paths(self):
         with TemporaryDirectory() as folder:

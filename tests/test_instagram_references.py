@@ -1,8 +1,11 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
+from farm import instagram_references, session_files
 from farm.instagram_references import ReferenceError, canonical_post_url, fetch_image
 
 
@@ -52,6 +55,18 @@ class ImageDownloadTests(unittest.TestCase):
         self.assertFalse(client.trust_env)
         self.assertFalse(client.calls[0][1]["allow_redirects"])
         self.assertTrue(client.closed)
+
+    def test_download_protection_has_no_posix_only_calls(self):
+        self.assertNotIn("os.fchmod", Path(instagram_references.__file__).read_text())
+        data = b"\xff\xd8\xff" + b"jpeg fixture"
+        client = FakeSession(FakeResponse([data]))
+        with TemporaryDirectory() as root, \
+                patch.object(session_files, "os", SimpleNamespace(name="nt")), \
+                patch.object(session_files, "protect") as protect:
+            path = Path(root) / "image.part"
+            fetch_image("https://scontent.cdninstagram.com/image.jpg", path, 100, session_factory=lambda: client)
+            self.assertEqual(path.read_bytes(), data)
+        protect.assert_called_once_with(path)
 
     def test_oversize_truncated_nonimage_and_timeout_leave_no_partial_file(self):
         responses = [

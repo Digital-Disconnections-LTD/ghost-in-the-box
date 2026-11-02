@@ -6,7 +6,9 @@ without live credentials. Do not publish working account sessions in an issue.
 
 Ghost in the Box operates on accounts you connect. Keep its state outside source
 repositories, protect session files, and use only accounts and content you are
-authorized to manage. Connected platforms and optional helpers have their own
+authorized to manage. Saved sessions and `login export` bundles are reusable
+account credentials; anyone holding one can act as that account.
+`ghost-in-the-box config` shows where they live. Connected platforms and optional helpers have their own
 data practices. Provider access can expire or require interactive recovery.
 
 An uncertain delivery may already exist on the provider. Reconcile it using

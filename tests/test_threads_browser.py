@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from farm.adapters.threads import AuthUnavailable, PublishUncertain, ThreadsReadFailure
 from farm.threads_browser import BrowserThreadsAdapter
+from farm.threads_transport import ThreadsDependencyUnavailable
 from farm.threads_reader import ThreadsReader
 
 
@@ -161,6 +162,63 @@ class BrowserAdapterTests(unittest.TestCase):
         self.assertEqual(reader.own_posts("mine")["posts"], [])
         self.assertEqual(reader.replies("mine", "123")["posts"], [])
         self.assertEqual(mobile.calls, 1)
+
+
+    def test_missing_node_setup_is_a_dependency_with_the_setup_command(self):
+        (self.state / "node-v24.22.1-linux-x64/bin/node").unlink()
+        adapter, calls = self.adapter("published")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SOCIAL_FARM_NODE", None)
+            with patch("farm.threads_transport._linux_x64", return_value=True), \
+                    self.assertRaises(ThreadsDependencyUnavailable) as raised:
+                adapter.publish(self.job)
+        self.assertEqual(raised.exception.dependency, "node")
+        self.assertIn("threads-setup --account mine", raised.exception.install)
+        self.assertEqual(str(raised.exception), "browser fallback needs one-time setup")
+        self.assertEqual(calls, [])
+
+    def test_headless_linux_without_xvfb_names_the_package(self):
+        adapter, calls = self.adapter("published")
+        with patch("farm.threads_browser.shutil.which", return_value=None), \
+                patch("farm.threads_browser.sys.platform", "linux"), \
+                patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DISPLAY", None)
+            os.environ.pop("WAYLAND_DISPLAY", None)
+            with self.assertRaises(ThreadsDependencyUnavailable) as raised:
+                adapter.publish(self.job)
+        self.assertEqual(raised.exception.dependency, "xvfb-run")
+        self.assertEqual(calls, [])
+
+    def test_bridge_receives_an_absolute_source_path(self):
+        adapter, calls = self.adapter("published", provider_id="123456",
+                                      permalink="https://www.threads.com/@mine/post/AbCd")
+        adapter.publish(self.job)
+        source = calls[0][1]["env"]["SOCIAL_FARM_THREADS_MCP_SOURCE"]
+        self.assertTrue(Path(source).is_absolute())
+
+
+
+class BrowserSetupCliTests(unittest.TestCase):
+    def run_setup(self, error):
+        from contextlib import redirect_stdout
+        import io
+        from scripts import threads_browser_setup as setup
+        output = io.StringIO()
+        with TemporaryDirectory() as folder, patch.object(setup, "BASE", Path(folder)), \
+                patch.object(setup, "_node", side_effect=error), redirect_stdout(output):
+            code = setup.main(["--account", "mine"])
+        return code, json.loads(output.getvalue())
+
+    def test_missing_node_on_other_platforms_is_a_dependency(self):
+        code, result = self.run_setup(RuntimeError("install_node_and_npm_for_this_platform"))
+        self.assertEqual((code, result["status"]), (4, "install_node_and_npm_for_this_platform"))
+        self.assertIn("SOCIAL_FARM_NODE", result["error"]["hint"])
+
+    def test_missing_git_is_a_dependency_and_other_failures_are_runtime(self):
+        code, result = self.run_setup(FileNotFoundError(2, "No such file", "git"))
+        self.assertEqual((code, result["status"]), (4, "git_required"))
+        code, result = self.run_setup(RuntimeError("setup_step_failed"))
+        self.assertEqual((code, result["status"]), (1, "setup_failed"))
 
 
 if __name__ == "__main__":

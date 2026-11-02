@@ -11,8 +11,9 @@ a provider fixture, or a better first-run experience can make a real difference.
   and its replies before drafting.
 - **A friendly interface:** build over the existing inbox, account registry, and
   outbox rather than introducing parallel stores.
-- **Reliable setup:** improve Linux/macOS installation and optional browser helper
-  diagnostics; report the versions you actually exercised.
+- **Reliable setup:** improve Linux, macOS and Windows installation, `doctor`
+  checks and optional browser helper diagnostics; report the versions you
+  actually exercised.
 - **Good documentation and artwork:** help people understand what is available,
   what needs account setup, and what is still growing.
 
@@ -28,6 +29,9 @@ paths. Documentation and artwork need relevant link or visual checks.
 1. Keep the change focused and explain the resulting behavior.
 2. Reuse the current state authorities and provider boundaries.
 3. Run `python -m unittest discover -s tests -v` in the development environment.
+   If you change a command or its help, update [docs/commands.md](docs/commands.md).
+   If you change the MCP tools, regenerate the catalog in [docs/mcp.md](docs/mcp.md#tool-catalog)
+   with `ghost-in-the-box instagram-mcp --list-tools --format md`.
 4. State the regression coverage, exact checks, and any limitations.
 5. Include screenshots for interface changes and platform/version details for
    integration fixes.

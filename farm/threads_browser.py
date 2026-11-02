@@ -6,12 +6,13 @@ Secrets cross only an inherited stdin pipe and are never logged or put in argv.
 
 from __future__ import annotations
 
-from farm.config import STATE_ROOT
+from farm.accounts import account_key_matches
+from farm.config import threads_browser_dir
 
 
 
 from contextlib import contextmanager
-import fcntl
+from farm import locking as fcntl
 import json
 import hashlib
 import os
@@ -25,9 +26,12 @@ from farm.accounts import AccountRegistry
 from farm.outbox import frozen_payload_matches
 from farm.adapters.threads import (AuthUnavailable, PreSendFailure,
                                    PublishUncertain, ThreadsReadFailure)
+from farm.threads_transport import (NODE_INSTALL, SETUP_COMMAND, XVFB_INSTALL,
+                                    ThreadsDependencyUnavailable,
+                                    node_paths, _linux_x64)
 
 
-BASE = STATE_ROOT / 'threads-browser-fallback'
+BASE = threads_browser_dir()
 BRIDGE = Path(__file__).resolve().parents[1] / "scripts/threads_browser_bridge.mjs"
 READ_BRIDGE = Path(__file__).resolve().parents[1] / "scripts/threads_browser_read_bridge.mjs"
 
@@ -38,7 +42,16 @@ def browser_command(node: Path, bridge: Path) -> list[str]:
         return [xvfb, "-a", str(node), str(bridge)]
     if sys.platform == "darwin" or os.name == "nt" or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
         return [str(node), str(bridge)]
-    raise AuthUnavailable("browser fallback needs a display or xvfb-run")
+    raise ThreadsDependencyUnavailable("xvfb-run", XVFB_INSTALL,
+                                       "browser fallback needs a display or xvfb-run")
+
+
+def _setup_missing(account: str, node: Path, message: str) -> ThreadsDependencyUnavailable:
+    """Name the missing piece of the Node browser and the command that installs it."""
+    if not node.is_file():
+        install = (SETUP_COMMAND if _linux_x64() else NODE_INSTALL).format(account=account)
+        return ThreadsDependencyUnavailable("node", install, message)
+    return ThreadsDependencyUnavailable("threads-mcp", SETUP_COMMAND.format(account=account), message)
 
 
 @contextmanager
@@ -68,6 +81,11 @@ class BrowserThreadsAdapter:
                                    self.state_dir.parent / "threads-scrapling")
 
     def _scrapling(self, account: str):
+        registration = self.registry.status("threads", account)
+        if registration and registration["kind"] == "cookie_jar":
+            from farm.threads_portable import PortableThreadsAdapter
+            return PortableThreadsAdapter(registry=self.registry,
+                                          state_dir=self.state_dir.parent / "threads-portable")
         from farm.threads_scrapling import ScraplingThreadsAdapter, verified_profile
         if verified_profile(account, self.scrapling_state_dir):
             return ScraplingThreadsAdapter(registry=self.registry, runner=self.runner,
@@ -125,7 +143,7 @@ class BrowserThreadsAdapter:
         if not str(job.get("body") or "").strip() or len(job["body"]) > 500:
             raise PreSendFailure("Threads text must contain 1..500 characters")
         registration = self.registry.status("threads", job["account"])
-        if not registration or registration["account_key"] != job.get("account_key"):
+        if not registration or not account_key_matches(registration, job.get("account_key")):
             raise PreSendFailure("Threads job account key mismatch")
         if job["action"] == "reply" and (
                 not str(job.get("target_id") or "").isdigit() or
@@ -135,11 +153,10 @@ class BrowserThreadsAdapter:
         if scrapling is not None:
             return scrapling.publish(job, verify_only=verify_only)
         sessionid, user_id = self._settings(job["account"])
-        source = Path(os.environ.get("SOCIAL_FARM_THREADS_MCP_SOURCE") or self.state_dir / "source")
-        node = Path(os.environ.get("SOCIAL_FARM_NODE") or shutil.which("node") or
-                    self.state_dir / "node-v24.22.1-linux-x64/bin/node")
+        node, source = node_paths(self.state_dir)
         if not (source / "build/browser/session.js").is_file() or not node.is_file():
-            raise AuthUnavailable("browser fallback needs one-time setup")
+            # The router maps this exact message to browser_setup_required.
+            raise _setup_missing(job["account"], node, "browser fallback needs one-time setup")
         command = browser_command(node, BRIDGE)
         payload = {
             "account": job["account"], "action": job["action"],
@@ -210,15 +227,10 @@ class BrowserThreadsAdapter:
             sessionid, user_id = self._settings(account)
         except AuthUnavailable as exc:
             raise ThreadsReadFailure("browser read account unavailable") from exc
-        source = Path(os.environ.get("SOCIAL_FARM_THREADS_MCP_SOURCE") or self.state_dir / "source")
-        node = Path(os.environ.get("SOCIAL_FARM_NODE") or shutil.which("node") or
-                    self.state_dir / "node-v24.22.1-linux-x64/bin/node")
+        node, source = node_paths(self.state_dir)
         if not (source / "build/browser/session.js").is_file() or not node.is_file():
-            raise ThreadsReadFailure("browser read setup unavailable")
-        try:
-            command = browser_command(node, READ_BRIDGE)
-        except AuthUnavailable as error:
-            raise ThreadsReadFailure(str(error)) from error
+            raise _setup_missing(account, node, "browser read setup unavailable")
+        command = browser_command(node, READ_BRIDGE)
         payload = {"account": account, "operation": operation, "limit": limit,
                    "post_id": post_id, "target_url": target_url,
                    "sessionid": sessionid, "user_id": user_id}

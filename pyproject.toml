@@ -16,14 +16,20 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Operating System :: POSIX",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
 ]
 
 [project.optional-dependencies]
 instagram = ["instagrapi==2.18.20", "Pillow>=10"]
 media = ["Pillow>=10"]
+login = ["playwright>=1.51,<2", "tzdata>=2025.1; sys_platform == 'win32'"]
 browser = ["scrapling[fetchers]>=0.3"]
 substack = ["python-substack[mcp]>=0.10,<0.11"]
-dev = ["Pillow>=10", "instagrapi==2.18.20", "build>=1"]
+# One-line quickstart: the login wizard plus Instagram and media support.
+recommended = ["playwright>=1.51,<2", "tzdata>=2025.1; sys_platform == 'win32'",
+               "instagrapi==2.18.20", "Pillow>=10"]
+dev = ["Pillow>=10", "instagrapi==2.18.20", "build>=1", "playwright>=1.51,<2"]
 
 [project.scripts]
 ghost-in-the-box = "farm.cli:main"

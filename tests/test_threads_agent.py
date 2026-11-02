@@ -15,8 +15,36 @@ from farm.accounts import AccountRegistry
 from farm.adapters.threads import AuthUnavailable, PreSendFailure, PublishUncertain
 from farm.inbox import Inbox
 from farm.outbox import Outbox
+from farm.threads_auth import ThreadsToken, save_token
 from farm.threads_cadence import ThreadsCadence
-from scripts.threads_agent import InputError, ProfileBusy, ThreadsAgent, job_summary, main
+from farm.threads_transport import LOGIN_INSTALL, ThreadsDependencyUnavailable
+from scripts import threads_agent
+from scripts.threads_agent import (AccountError, InputError, ProfileBusy, ThreadsAgent,
+                                   job_summary, main)
+from test_login import session as wizard_session
+
+
+TOKEN = "IGT:2:" + "A" * 40
+
+
+class Response:
+    def __init__(self, status_code, payload):
+        self.status_code, self.payload = status_code, payload
+
+    def json(self):
+        return self.payload
+
+
+class Http:
+    def __init__(self, response):
+        self.response, self.requests, self.closed = response, [], False
+
+    def get(self, url, **kwargs):
+        self.requests.append((url, kwargs))
+        return self.response
+
+    def close(self):
+        self.closed = True
 
 
 class FakeBrowser:
@@ -30,6 +58,12 @@ class FakeBrowser:
             raise self.error
         return {"provider_id": "123456789",
                 "permalink": f"https://www.threads.com/@{job['account']}/post/AbCd"}
+
+    def verify(self, account):
+        self.calls.append(("verify", account, "verify"))
+        if self.error:
+            raise self.error
+        return {"status": "verified", "account": account}
 
 
 class ThreadsAgentTests(unittest.TestCase):
@@ -53,6 +87,8 @@ class ThreadsAgentTests(unittest.TestCase):
         self.browser = FakeBrowser()
         self.runner = Mock()
         self.reader = Mock()
+        self.portable = Mock()
+        self.installed = {"playwright", "scrapling"}
         self.agent = ThreadsAgent(
             registry=self.registry, db=self.db, state_dir=self.state,
             session_dir=self.sessions, python=sys.executable, runner=self.runner,
@@ -60,6 +96,9 @@ class ThreadsAgentTests(unittest.TestCase):
             browser_factory=lambda: self.browser, reader=self.reader, clock=lambda: self.now,
             inbox_factory=lambda: Inbox(self.inbox_db),
             post_marker=self.root / "threadspost",
+            portable_factory=lambda: self.portable,
+            available=lambda name, python=None: name in self.installed,
+            auth_dir=self.root / "threads-auth",
         )
         for account in ("one", "two"):
             session = self.make_session(account)
@@ -86,8 +125,9 @@ class ThreadsAgentTests(unittest.TestCase):
                                       "cookies": [{"value": "PRIVATE_TEST_COOKIE"}]}))
         marker.chmod(0o600)
 
-    def create(self, key="message-one", account="one", **kwargs):
-        return self.agent.create(account, body_file=str(self.body), idempotency_key=key, **kwargs)
+    def create(self, key="message-one", account="one", now=True, **kwargs):
+        return self.agent.create(account, body_file=str(self.body), idempotency_key=key,
+                                 now=now, **kwargs)
 
     def comment(self, account="one", comment_id="789", worker="operator"):
         inbox = Inbox(self.inbox_db)
@@ -103,8 +143,9 @@ class ThreadsAgentTests(unittest.TestCase):
         finally:
             inbox.close()
 
-    def reply_inbox(self, **kwargs):
-        return self.agent.reply_inbox("one", comment_id="789", body_file=str(self.body), **kwargs)
+    def reply_inbox(self, now=True, **kwargs):
+        return self.agent.reply_inbox("one", comment_id="789", body_file=str(self.body),
+                                      now=now, **kwargs)
 
     def test_inbox_reply_consumes_comment_and_retains_source_target(self):
         self.comment()
@@ -128,7 +169,7 @@ class ThreadsAgentTests(unittest.TestCase):
 
     def test_inbox_queue_only_resumes_the_same_job_without_a_new_key(self):
         self.comment()
-        queued = self.reply_inbox(queue_only=True)
+        queued = self.reply_inbox(now=False)
         self.assertEqual(queued["status"], "queued")
         self.assertEqual(self.browser.calls, [])
         published = self.reply_inbox()
@@ -146,17 +187,17 @@ class ThreadsAgentTests(unittest.TestCase):
         with self.assertRaisesRegex(InputError, "inbox_comment_not_claimed_by_worker"):
             self.reply_inbox()
         with self.assertRaisesRegex(InputError, "inbox_comment_not_found"):
-            self.agent.reply_inbox("two", comment_id="789", body_file=str(self.body))
+            self.agent.reply_inbox("two", comment_id="789", body_file=str(self.body), now=True)
         self.comment(comment_id="790", worker=None)
         with self.assertRaisesRegex(InputError, "inbox_comment_not_claimed_by_worker"):
-            self.agent.reply_inbox("one", comment_id="790", body_file=str(self.body))
+            self.agent.reply_inbox("one", comment_id="790", body_file=str(self.body), now=True)
         with Outbox(self.db) as box:
             self.assertEqual(box.list(status="all"), [])
         self.assertEqual(self.browser.calls, [])
 
     def test_inbox_reply_uses_the_selected_worker_claim(self):
         self.comment(worker="community-helper")
-        result = self.reply_inbox(worker="community-helper", queue_only=True)
+        result = self.reply_inbox(worker="community-helper", now=False)
         self.assertEqual(result["status"], "queued")
         with Outbox(self.db) as box:
             self.assertEqual(box.get(result["job_id"])["target_id"], "789")
@@ -360,8 +401,8 @@ class ThreadsAgentTests(unittest.TestCase):
         self.assertEqual(len(self.browser.calls), 1)
 
     def test_account_isolation_and_exact_job_selection(self):
-        one = self.create("older", queue_only=True)
-        later = self.create("selected", queue_only=True)
+        one = self.create("older", now=False)
+        later = self.create("selected", now=False)
         self.assertEqual(self.agent.publish("one", later["job_id"])["status"], "published")
         with self.assertRaisesRegex(InputError, "job_account_mismatch"):
             self.agent.publish("two", one["job_id"])
@@ -522,16 +563,274 @@ class ThreadsAgentTests(unittest.TestCase):
         with patch("scripts.threads_agent.ThreadsAgent") as factory, redirect_stdout(output):
             factory.return_value.read.side_effect = RuntimeError("secret=PRIVATE_PROVIDER_TOKEN")
             code = main(["--account", "one", "read", "own"])
-        self.assertEqual(code, 2)
-        self.assertEqual(json.loads(output.getvalue()), {"ok": False, "status": "operation_unavailable"})
+        self.assertEqual(code, 1)
+        result = json.loads(output.getvalue())
+        self.assertEqual((result["ok"], result["status"]), (False, "operation_unavailable"))
+        self.assertEqual(result["error"]["code"], "operation_unavailable")
+        self.assertNotIn("PRIVATE_PROVIDER_TOKEN", output.getvalue())
 
     def test_cli_distinguishes_local_profile_contention_from_provider_limits(self):
         output = io.StringIO()
         with patch("scripts.threads_agent.ThreadsAgent") as factory, redirect_stdout(output):
             factory.return_value.read.side_effect = ProfileBusy("local browser profile remained busy")
             code = main(["--account", "one", "read", "search", "--query", "local AI"])
+        self.assertEqual(code, 1)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["status"], "profile_busy")
+        self.assertEqual(result["error"]["code"], "profile_busy")
+
+
+class ThreadsAgentTransportTests(unittest.TestCase):
+    """Wizard logins, transport choice, safe defaults and the terminal contract."""
+
+    setUp = ThreadsAgentTests.setUp
+    make_session = ThreadsAgentTests.make_session
+    make_profile = ThreadsAgentTests.make_profile
+    create = ThreadsAgentTests.create
+
+    def wizard(self, account="mine"):
+        from farm.login import save_login
+        save_login("threads", account, wizard_session("threads", account),
+                   registry=self.registry, state_root=self.root / "state")
+        return self.registry.get("threads", account)
+
+    def cli(self, argv, *, stdin=None):
+        output = io.StringIO()
+        with patch.object(threads_agent, "ThreadsAgent", return_value=self.agent), \
+                patch.object(threads_agent.sys, "stdin", stdin or io.StringIO("")), \
+                redirect_stdout(output):
+            code = main(argv)
+        return code, json.loads(output.getvalue())
+
+    def test_post_defaults_to_queue_only_and_names_the_publish_step(self):
+        result = self.agent.create("one", body_file=str(self.body), idempotency_key="safe")
+        self.assertEqual((result["ok"], result["status"]), (True, "queued"))
+        self.assertEqual(self.browser.calls, [])
+        self.assertEqual(result["next_step"],
+                         f"ghost-in-the-box threads --account one publish {result['job_id']}")
+        with Outbox(self.db) as box:
+            self.assertEqual(box.get(result["job_id"])["attempts"], 0)
+        published = self.agent.publish("one", result["job_id"])
+        self.assertEqual(published["status"], "published")
+        self.assertEqual(len(self.browser.calls), 1)
+
+    def test_derived_idempotency_key_reuses_one_job_for_the_same_text(self):
+        first = self.agent.create("one", body="Same words.")
+        again = self.agent.create("one", body="Same words.")
+        other = self.agent.create("one", body="Different words.")
+        self.assertEqual(first["job_id"], again["job_id"])
+        self.assertNotEqual(first["job_id"], other["job_id"])
+        self.assertRegex(first["idempotency_key"], r"^auto-[0-9a-f]{32}$")
+        reply = self.agent.create("one", body="Same words.", action="reply", post_id="123",
+                                  url="https://www.threads.com/@reader/post/abc")
+        self.assertNotEqual(reply["job_id"], first["job_id"])
+        self.assertEqual(self.browser.calls, [])
+
+    def test_cookie_jar_registration_from_login_wizard_is_accepted(self):
+        entry = self.wizard()
+        self.assertEqual(entry["kind"], "cookie_jar")
+        status = self.agent.status("mine")
+        self.assertEqual(status["status"], "ready")
+        self.assertEqual(status["registration_kind"], "cookie_jar")
+        self.assertEqual(status["transport"]["name"], "portable")
+        self.assertTrue(status["transport"]["ready"])
+        self.assertEqual(status["publish_job_transport"]["name"], "portable")
+        self.portable.read.return_value = {"posts": [{"id": "9"}]}
+        read = self.agent.read("mine", "own", limit=3)
+        self.assertEqual((read["transport"], read["result"]["posts"][0]["id"]), ("portable", "9"))
+        self.portable.read.assert_called_once_with("mine", "own", limit=3, post_id="",
+                                                   target_url="")
+        self.reader.read.assert_not_called()
+        queued = self.agent.create("mine", body="From the wizard login.")
+        self.assertEqual(queued["status"], "queued")
+        published = self.agent.publish("mine", queued["job_id"])
+        self.assertEqual(published["status"], "published")
+        self.assertEqual(self.browser.calls[-1][1], "mine")
+
+    def test_reconcile_for_wizard_account_reads_the_portable_receipt(self):
+        self.wizard()
+        self.browser.error = PublishUncertain("receipt delayed")
+        sent = self.agent.create("mine", body="Uncertain text.", now=True)
+        self.assertEqual(sent["status"], "uncertain")
+        self.portable.reconcile.return_value = {
+            "status": "published", "provider_id": "77",
+            "permalink": "https://www.threads.com/@mine/post/R"}
+        confirmed = self.agent.reconcile("mine", sent["job_id"])
+        self.assertEqual(confirmed["provider_id"], "77")
+        self.portable.reconcile.assert_called_once()
+        self.reader.reconcile.assert_not_called()
+
+    def test_connect_reuses_wizard_login_and_refresh_points_to_the_wizard(self):
+        self.wizard()
+        result = self.agent.connect("mine")
+        self.assertEqual((result["status"], result["transport"]), ("connected", "portable"))
+        self.runner.assert_not_called()
+        with self.assertRaises(AccountError) as raised:
+            self.agent.connect("mine", refresh=True)
+        self.assertEqual(raised.exception.code, "login_wizard_refresh_required")
+        self.assertIn("login start --platform threads --account mine", raised.exception.hint)
+
+    def test_unsupported_registration_kind_names_the_kind(self):
+        profile = self.root / "profile-dir"
+        profile.mkdir()
+        self.registry.register(platform="threads", account="odd", kind="browser_profile",
+                               session_file=profile)
+        with self.assertRaises(AccountError) as raised:
+            self.agent.read("odd", "own")
+        self.assertEqual(raised.exception.code, "registration_unsupported")
+        self.assertIn("'browser_profile'", raised.exception.message)
+        status = self.agent.status("odd")
+        self.assertEqual(status["status"], "connect_required")
+        self.assertIn("'browser_profile'", status["transport"]["reason"])
+        code, printed = self.cli(["--account", "odd", "post", "--body", "hello"])
+        self.assertEqual(code, 4)
+        self.assertEqual(printed["error"]["code"], "registration_unsupported")
+        self.assertIn("browser_profile", printed["error"]["message"])
+
+    def test_missing_scrapling_returns_install_command_without_any_browser_call(self):
+        self.installed = {"playwright"}
+        result = self.create()
+        self.assertEqual(result["status"], "dependency_unavailable")
+        self.assertEqual(result["dependency"], "scrapling")
+        self.assertIn("[browser]", result["install"])
+        self.assertEqual(self.browser.calls, [])
+        with Outbox(self.db) as box:
+            self.assertEqual(box.get(result["job_id"])["status"], "queued")
+        self.assertEqual(self.agent.status("one")["status"], "dependency_unavailable")
+        self.assertEqual(self.agent.read("one", "own")["status"], "dependency_unavailable")
+        self.reader.read.assert_not_called()
+
+    def test_wizard_account_without_playwright_names_the_login_extra(self):
+        self.wizard()
+        self.installed = set()
+        queued = self.agent.create("mine", body="Needs a browser.")
+        code, printed = self.cli(["--account", "mine", "publish", queued["job_id"]])
+        self.assertEqual(code, 4)
+        self.assertEqual((printed["status"], printed["dependency"]),
+                         ("dependency_unavailable", "playwright"))
+        self.assertEqual(printed["install"], LOGIN_INSTALL)
+        self.assertEqual(printed["error"]["hint"], LOGIN_INSTALL)
+        self.assertEqual(self.browser.calls, [])
+
+    def test_dependency_found_missing_during_publish_keeps_job_queued(self):
+        self.browser.error = ThreadsDependencyUnavailable("chromium",
+                                                          "python -m playwright install chromium")
+        result = self.create()
+        self.assertEqual((result["status"], result["dependency"]),
+                         ("dependency_unavailable", "chromium"))
+        with Outbox(self.db) as box:
+            job = box.get(result["job_id"])
+        self.assertEqual((job["status"], job["attempts"]), ("queued", 1))
+        self.assertIsNone(self.agent.status("one")["next_original_at"])
+
+    def test_default_post_marker_lives_in_the_state_dir(self):
+        agent = ThreadsAgent(registry=self.registry, db=self.db, reader=self.reader)
+        from farm.config import STATE_ROOT, threads_post_marker
+        self.assertEqual(agent.post_marker, threads_post_marker())
+        self.assertNotEqual(agent.post_marker.parent, Path.home())
+        with patch.dict(os.environ, {"SOCIAL_FARM_THREADS_WORK_DIR": ""}):
+            self.assertTrue(threads_post_marker().is_relative_to(STATE_ROOT))
+
+    def test_post_marker_is_written_where_o_nofollow_is_unavailable(self):
+        self.agent.post_marker = self.root / "nested" / "threadspost"
+        saved = os.O_NOFOLLOW
+        del os.O_NOFOLLOW
+        try:
+            self.create()
+        finally:
+            os.O_NOFOLLOW = saved
+        self.assertTrue(self.agent.post_marker.is_file())
+
+    def save_bearer(self, username="one", user_id="12345"):
+        save_token(ThreadsToken(TOKEN, user_id, "android-0123456789abc", username,
+                                "2026-10-26T00:00:00+00:00"), self.root / "threads-auth")
+
+    def test_check_verifies_browser_and_mobile_identity_without_posting(self):
+        self.save_bearer()
+        http = Http(Response(200, {"user": {"pk": 12345, "username": "one"}, "status": "ok"}))
+        self.agent.http_factory = lambda: http
+        result = self.agent.check("one")
+        self.assertEqual((result["ok"], result["status"]), (True, "verified"))
+        self.assertEqual(set(result["checks"]), {"scrapling", "mobile"})
+        self.assertEqual(self.browser.calls, [("verify", "one", "verify")])
+        self.assertEqual(http.requests[0][1]["headers"]["Authorization"], "Bearer " + TOKEN)
+        self.assertTrue(http.closed)
+        with Outbox(self.db) as box:
+            self.assertEqual(box.list(status="all"), [])
+        self.assertNotIn(TOKEN, json.dumps(result))
+
+    def test_check_flags_a_mobile_bearer_owned_by_another_account(self):
+        self.save_bearer()
+        self.agent.http_factory = lambda: Http(Response(200, {"user": {"pk": 999, "username": "two"}}))
+        code, printed = self.cli(["--account", "one", "check"])
+        self.assertEqual(code, 4)
+        self.assertEqual(printed["status"], "identity_mismatch")
+        self.assertTrue(printed["checks"]["scrapling"]["ok"])
+        self.assertFalse(printed["checks"]["mobile"]["ok"])
+
+    def test_check_respects_quiet_hours(self):
+        self.now = datetime(2026, 10, 27, 4, tzinfo=timezone.utc)
+        self.assertEqual(self.agent.check("one")["status"], "quiet_hours")
+        self.assertEqual(self.browser.calls, [])
+
+    def test_cli_post_queues_by_default_and_now_publishes(self):
+        code, queued = self.cli(["--account", "one", "post", "--body", "Queued text."])
+        self.assertEqual((code, queued["status"]), (0, "queued"))
+        self.assertEqual(self.browser.calls, [])
+        code, published = self.cli(["--account", "one", "post", "--body", "Sent text.", "--now"])
+        self.assertEqual((code, published["status"]), (0, "published"))
+        self.assertEqual(len(self.browser.calls), 1)
+
+    def test_cli_queue_only_is_a_no_op_alias_and_cannot_combine_with_now(self):
+        code, queued = self.cli(["--account", "one", "post", "--body", "Alias.", "--queue-only"])
+        self.assertEqual((code, queued["status"]), (0, "queued"))
+        errors = io.StringIO()
+        with patch("sys.stderr", errors), self.assertRaises(SystemExit) as raised:
+            main(["--account", "one", "post", "--body", "x", "--now", "--queue-only"])
+        self.assertEqual(raised.exception.code, 2)
+        with patch("sys.stderr", errors), self.assertRaises(SystemExit) as raised:
+            main(["--account", "one", "post", "--body", "x", "--body-file", str(self.body)])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(self.browser.calls, [])
+
+    def test_cli_reads_body_from_stdin(self):
+        code, queued = self.cli(["--account", "one", "reply", "--body-file", "-",
+                                 "--target-id", "123",
+                                 "--target-url", "https://www.threads.com/@reader/post/abc"],
+                                stdin=io.StringIO("Reply from a pipe."))
+        self.assertEqual(code, 0)
+        with Outbox(self.db) as box:
+            self.assertEqual(box.get(queued["job_id"])["body"], "Reply from a pipe.")
+
+    def test_cli_error_envelope_and_exit_codes(self):
+        code, usage = self.cli(["--account", "one", "post", "--body", "x" * 501])
         self.assertEqual(code, 2)
-        self.assertEqual(json.loads(output.getvalue()), {"ok": False, "status": "profile_busy"})
+        self.assertEqual(usage["status"], "text_must_contain_1_to_500_characters")
+        self.assertEqual(set(usage["error"]), {"code", "message", "hint"})
+        code, missing = self.cli(["--account", "nobody", "status"])
+        self.assertEqual((code, missing["status"]), (0, "connect_required"))
+        code, auth = self.cli(["--account", "nobody", "post", "--body", "hello"])
+        self.assertEqual(code, 4)
+        self.assertEqual(auth["error"]["code"], "linked_account_registration_required")
+        self.assertIn("login start --platform threads --account nobody", auth["error"]["hint"])
+        self.browser.error = PublishUncertain("timeout")
+        code, uncertain = self.cli(["--account", "one", "post", "--body", "Maybe.", "--now"])
+        self.assertEqual((code, uncertain["status"]), (3, "uncertain"))
+        self.assertIn(f"reconcile {uncertain['job_id']}", uncertain["error"]["hint"])
+        code, not_found = self.cli(["--account", "one", "job", "missing-job"])
+        self.assertEqual((code, not_found["error"]["code"]), (2, "job_not_found"))
+        self.assertIn("missing-job", not_found["error"]["message"])
+
+    def test_help_text_is_distinct_for_every_command(self):
+        output = io.StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit):
+            main(["--account", "one", "--help"])
+        text = output.getvalue()
+        helps = [threads_agent.HELP[name] for name in ("publish", "job", "reconcile", "retry",
+                                                       "post", "reply")]
+        self.assertEqual(len(set(helps)), len(helps))
+        for name in ("publish", "job", "reconcile", "retry", "check", "mobile-login"):
+            self.assertIn(threads_agent.HELP[name][:30], " ".join(text.split()))
 
 
 if __name__ == "__main__":

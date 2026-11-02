@@ -404,7 +404,10 @@ def run(command, *, factory=None):
     result = {"status": "auth_unavailable"}
     with login.lock(account_dir / ".lock"):
         if factory is None:
-            from scrapling.fetchers import StealthySession
+            try:
+                from scrapling.fetchers import StealthySession
+            except ImportError:
+                return {"status": "dependency_unavailable", "dependency": "scrapling"}
             factory = StealthySession
         try:
             with factory(user_data_dir=str(profile), headless=True, locale="en-US",

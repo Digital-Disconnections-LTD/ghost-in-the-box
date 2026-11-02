@@ -17,7 +17,8 @@ notice remain in `farm/threads_native_auth.py` and
 Ghost in the Box imports or connects to separately installed projects including
 [Instagrapi](https://github.com/subzeroid/instagrapi),
 [Scrapling](https://github.com/D4Vinci/Scrapling),
-[python-substack](https://github.com/ma2za/python-substack), Requests, and Pillow.
+[python-substack](https://github.com/ma2za/python-substack),
+[Playwright](https://github.com/microsoft/playwright-python), Requests, and Pillow.
 Their packages and optional browser runtimes retain their own terms and notices;
 this repository does not relicense them or claim their endorsement.
 

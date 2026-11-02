@@ -12,10 +12,17 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from farm import config
 from farm.accounts import AccountRegistry
 from farm.adapters.instagram import AuthUnavailable, PublishUncertain
 from farm.inbox import Inbox
-from farm.instagram_mcp import InstagramTools, TOOLS, ToolInputError, dispatch, read_message, serve, write_message
+from farm import instagram_mcp
+from farm.instagram_mcp import (
+    LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, TOOLS, AccountSelectionError, InstagramTools,
+    ToolInputError, catalog, catalog_markdown, dispatch, read_message, resolve_account, serve, server_version,
+    substack_catalog, tool_catalog, write_message,
+)
+from farm.instagram_session import InstagramSessionError
 from farm.instagram_references import ReferenceError
 from farm.outbox import Outbox
 
@@ -206,6 +213,52 @@ class InstagramMCPTests(unittest.TestCase):
         self.assertEqual(result["job"]["provider_id"], "9000")
         self.assertEqual(self.adapter.sent, [])
 
+    def test_reconcile_keeps_the_expired_token_so_a_late_receipt_still_records(self):
+        job = self.draft()
+        self.call("queue_job", job_id=job["id"])
+        with Outbox(self.db) as box:
+            claimed = box.claim_job(job["id"], platform="instagram")
+            box.db.execute("UPDATE jobs SET lease_until='2000-01-01T00:00:00Z' WHERE id=?", (job["id"],))
+        with patch.object(self.client, "media_info_v1", return_value=self.client.post(caption="Wrong", pk="9000")):
+            with self.assertRaisesRegex(ToolInputError, "does not match"):
+                self.call("reconcile_job", job_id=job["id"], outcome="published", provider_id="9000", reason="seen")
+        with Outbox(self.db) as box:
+            self.assertEqual(box.get(job["id"])["status"], "uncertain")
+            late = box.finish(job["id"], claimed["lease_token"], outcome="published", provider_id="9000")
+        self.assertEqual((late["status"], late["provider_id"]), ("published", "9000"))
+
+    def test_cancelled_jobs_are_a_listable_state_with_a_next_step(self):
+        self.assertIn("cancelled", instagram_mcp.JOB_STATES)
+        job = self.draft()
+        with Outbox(self.db) as box:
+            box.cancel(job["id"])
+        listed = self.call("jobs", status="cancelled")["jobs"]
+        self.assertEqual([item["id"] for item in listed], [job["id"]])
+        error, result = self.rpc("publish_job", {"job_id": job["id"]})
+        self.assertTrue(error)
+        self.assertIn("instagram_draft_carousel", result["error"]["hint"])
+
+    def test_outbox_refusals_get_tool_hints_instead_of_cli_commands(self):
+        job = self.draft()
+        self.call("queue_job", job_id=job["id"])
+        error, result = self.rpc("retry_job", {"job_id": job["id"], "reason": "fixed"})
+        self.assertTrue(error)
+        self.assertEqual(result["error"]["code"], "not_failed")
+        self.assertIn("instagram_job", result["error"]["hint"])
+        self.assertNotIn("ghost-in-the-box outbox", result["error"]["hint"])
+
+    def test_only_publishing_is_marked_destructive(self):
+        destructive = {item["name"] for item in TOOLS if item["annotations"]["destructiveHint"]}
+        self.assertEqual(destructive, {"instagram_publish_job"})
+
+    def test_publisher_statuses_all_have_messages_and_hints(self):
+        for status in ("rejected", "receipt_not_recorded", "lease_lost", "outbox_refused", "outbox_unavailable"):
+            with self.subTest(status=status):
+                message, hint = instagram_mcp.PUBLISH_ERRORS[status]
+                self.assertTrue(message and hint)
+                failure = instagram_mcp._structured_failure({"ok": False, "status": status}, "mine")
+                self.assertEqual(failure["error"]["code"], status)
+
     def test_comments_persist_then_claim_and_reply_are_idempotent(self):
         result = self.call("comments", media_id="42_7")
         self.assertEqual(result["next_cursor"], "next-comments")
@@ -244,7 +297,10 @@ class InstagramMCPTests(unittest.TestCase):
         with patch.object(self.service, "status", side_effect=RuntimeError("private_sentinel")):
             error, result = self.rpc("status")
         self.assertTrue(error)
-        self.assertEqual(result, {"ok": False, "error_type": "RuntimeError"})
+        self.assertEqual(result["error_type"], "RuntimeError")
+        self.assertEqual(result["error"]["code"], "internal_error")
+        self.assertTrue(result["error"]["hint"])
+        self.assertNotIn("private_sentinel", json.dumps(result))
         self.assertIsNone(dispatch(self.service, {"jsonrpc": "2.0", "method": "tools/call",
             "params": {"name": "instagram_publish_job", "arguments": {"job_id": "ignored"}}}))
         self.assertEqual(self.adapter.sent, [])
@@ -329,6 +385,8 @@ class InstagramMCPTests(unittest.TestCase):
         self.assertTrue(error)
         self.assertEqual(len(result["image_paths"]), 1)
         self.assertEqual(result["next_start_index"], 2)
+        self.assertEqual(result["error"]["code"], "download_incomplete")
+        self.assertIn("start_index=2", result["error"]["hint"])
         self.assertNotIn("private provider body", json.dumps(result))
         self.assertEqual(list(Path(result["directory"]).glob(".image-*")), [])
         self.assertEqual(len(self.call("references")["posts"][0]["image_paths"]), 1)
@@ -378,6 +436,304 @@ class InstagramMCPTests(unittest.TestCase):
             self.call("inspect_slide", image_path=result["image_paths"][0])
         self.assertEqual(len(calls), 1)
 
+    def test_failed_calls_carry_code_message_and_hint(self):
+        error, result = self.rpc("job", {"job_id": "missing"})
+        self.assertTrue(error)
+        self.assertEqual(result["error"]["code"], "job_not_found")
+        self.assertIn("instagram_jobs", result["error"]["hint"])
+        error, result = self.rpc("sync_inbox", {"posts": 999})
+        self.assertEqual(result["error"]["code"], "invalid_arguments")
+        self.assertIn("inputSchema", result["error"]["hint"])
+        draft = self.draft()
+        error, result = self.rpc("publish_job", {"job_id": draft["id"]})
+        self.assertTrue(error)
+        self.assertEqual((result["status"], result["error"]["code"]), ("not_queued", "not_queued"))
+        self.assertIn("instagram_queue_job", result["error"]["hint"])
+        error, result = self.rpc("queue_job", {"job_id": draft["id"], "at": "tomorrow"})
+        self.assertTrue(error)
+        self.assertNotEqual(result["error"]["code"], "internal_error")
+        self.assertTrue(result["error"]["message"])
+        self.assertEqual(self.call("job", job_id=draft["id"])["job"]["status"], "draft")
+        for response in (self.rpc("job", {"job_id": "missing"})[1], result):
+            self.assertEqual(set(response["error"]), {"code", "message", "hint"})
+        self.assertEqual(self.adapter.sent, [])
+
+    def test_publisher_results_get_tool_hints_with_or_without_an_envelope(self):
+        legacy = instagram_mcp._structured_failure({"ok": False, "status": "uncertain", "job_id": "j"}, "mine")
+        self.assertEqual((legacy["status"], legacy["error"]["code"]), ("uncertain", "uncertain"))
+        self.assertIn("instagram_reconcile_job", legacy["error"]["hint"])
+        auth = instagram_mcp._structured_failure({"ok": False, "status": "auth_unavailable"}, "mine")
+        self.assertIn("--account mine", auth["error"]["hint"])
+        coded = instagram_mcp._structured_failure({"ok": False, "status": "not_queued", "job_status": "failed",
+            "error": {"code": "not_queued", "message": "Job j is failed, not queued.", "hint": "cli"}}, "mine")
+        self.assertEqual(coded["error"]["message"], "Job j is failed, not queued.")
+        self.assertIn("instagram_retry_job", coded["error"]["hint"])
+        unknown = instagram_mcp._structured_failure({"ok": False, "status": "brand_new",
+            "error": {"code": "brand_new_code", "message": "m", "hint": "publisher hint"}}, "mine")
+        self.assertEqual((unknown["error"]["code"], unknown["error"]["hint"]), ("brand_new_code", "publisher hint"))
+        self.assertEqual(instagram_mcp._structured_failure({"ok": True}, "mine"), {"ok": True})
+
+    def test_session_failures_name_the_login_command_for_this_account(self):
+        def unavailable(*_args, **_kwargs):
+            raise InstagramSessionError("session_unavailable")
+        self.service.reader = unavailable
+        error, result = self.rpc("own_posts")
+        self.assertTrue(error)
+        self.assertEqual(result["error"]["code"], "session_unavailable")
+        self.assertIn("login start --platform instagram --account mine", result["error"]["hint"])
+        self.service.reader = lambda *_args, **_kwargs: (_ for _ in ()).throw(InstagramSessionError("<odd text>"))
+        self.assertEqual(self.rpc("own_posts")[1]["error"]["code"], "session_unavailable")
+
+    def test_missing_instagram_library_is_a_dependency_error_not_a_crash(self):
+        with patch.dict(sys.modules, {"instagrapi": None}):
+            with self.assertRaises(InstagramSessionError) as raised:
+                instagram_mcp._new_client()
+        self.assertEqual(str(raised.exception), "dependency_unavailable")
+        self.service.reader = lambda *_args, **_kwargs: instagram_mcp._new_client()
+        with patch.dict(sys.modules, {"instagrapi": None}):
+            error, result = self.rpc("own_posts")
+        self.assertTrue(error)
+        self.assertEqual(result["error"]["code"], "dependency_unavailable")
+        self.assertIn(config.install_command("instagram"), result["error"]["hint"])
+
+    def test_status_without_a_session_explains_how_to_sign_in(self):
+        offline = InstagramTools(account="nobody_yet", outbox_path=self.db, registry=self.registry)
+        result = offline.call("instagram_status", {})
+        self.assertFalse(result["session_ready"])
+        self.assertIn("--account nobody_yet", result["hint"])
+        self.assertNotIn("hint", self.call("status"))
+
+    def test_placeholder_account_fails_every_tool_loudly(self):
+        placeholder = InstagramTools(account="example_creator", outbox_path=self.db, inbox_path=self.inbox_db,
+                                     registry=self.registry, reference_root=self.root / "references")
+        for name, arguments in (("instagram_status", {}), ("instagram_inbox", {}), ("instagram_jobs", {})):
+            response = dispatch(placeholder, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                              "params": {"name": name, "arguments": arguments}})
+            result = json.loads(response["result"]["content"][0]["text"])
+            self.assertTrue(response["result"]["isError"])
+            self.assertEqual(result["error"]["code"], "placeholder_account")
+        self.assertFalse(self.inbox_db.exists())
+        session = self.root / "real-example-session.json"
+        session.write_text("{}")
+        session.chmod(0o600)
+        self.registry.register(platform="instagram", account="example_creator", kind="instagrapi_settings",
+                               session_file=session)
+        self.assertTrue(placeholder.call("instagram_status", {})["ok"])
+
+    def test_mcp_publish_still_sends_a_future_scheduled_job_on_request(self):
+        job = self.draft()
+        self.call("queue_job", job_id=job["id"], at="2999-01-01T09:00:00+00:00")
+        result = self.call("publish_job", job_id=job["id"])
+        self.assertEqual(result["status"], "published")
+        self.assertEqual(self.adapter.sent, [job["id"]])
+
+    def test_tools_have_titles_for_old_and_new_clients(self):
+        self.assertEqual(len({item["title"] for item in TOOLS}), len(TOOLS))
+        for item in TOOLS:
+            self.assertTrue(item["title"].strip())
+            self.assertEqual(item["annotations"]["title"], item["title"])
+
+
+class ProtocolNegotiationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.service = InstagramTools(account="mine", registry=AccountRegistry(Path(self.temp.name) / "a.json"))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def initialize(self, params, session=None):
+        return dispatch(self.service, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params},
+                        session)["result"]
+
+    def test_supported_versions_are_echoed_and_others_get_the_latest(self):
+        for version in SUPPORTED_PROTOCOL_VERSIONS:
+            self.assertEqual(self.initialize({"protocolVersion": version})["protocolVersion"], version)
+        for params in ({"protocolVersion": "1999-01-01"}, {"protocolVersion": ["2025-06-18"]}, {}):
+            self.assertEqual(self.initialize(params)["protocolVersion"], LATEST_PROTOCOL_VERSION)
+        self.assertEqual(LATEST_PROTOCOL_VERSION, "2025-06-18")
+
+    def test_server_version_comes_from_package_metadata(self):
+        info = self.initialize({"protocolVersion": "2025-06-18"})["serverInfo"]
+        self.assertEqual(info["name"], "ghost-in-the-box-instagram")
+        self.assertTrue(info["title"])
+        self.assertEqual(info["version"], config.package_version())
+        self.assertEqual(server_version(), config.package_version())
+        self.assertNotEqual(info["version"], "1.0.0")
+
+    def test_server_version_falls_back_to_the_project_file_then_unknown(self):
+        missing = config.importlib.metadata.PackageNotFoundError("ghost-in-the-box")
+        with patch.object(config.importlib.metadata, "version", side_effect=missing):
+            self.assertEqual(server_version(), project_version())
+            with patch.object(Path, "open", side_effect=OSError("unreadable")):
+                self.assertEqual(server_version(), "0+unknown")
+
+    def test_batches_are_accepted_only_after_negotiating_2025_03_26(self):
+        batch = [{"jsonrpc": "2.0", "id": 2, "method": "ping"},
+                 {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                 {"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
+                 {"jsonrpc": "2.0", "id": 4, "method": "initialize", "params": {}}]
+        for version, accepted in (("2025-03-26", True), ("2025-06-18", False), ("2024-11-05", False)):
+            with self.subTest(version=version):
+                source, output = io.BytesIO(), io.BytesIO()
+                write_message(source, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                       "params": {"protocolVersion": version}}, "lines")
+                write_message(source, batch, "lines")
+                write_message(source, [{"jsonrpc": "2.0", "method": "notifications/initialized"}], "lines")
+                source.seek(0)
+                self.assertEqual(serve(self.service, source, output), 0)
+                replies = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual(replies[0]["result"]["protocolVersion"], version)
+                if accepted:
+                    self.assertEqual(len(replies), 2)
+                    self.assertEqual([item["id"] for item in replies[1]], [2, 3, 4])
+                    self.assertEqual(len(replies[1][1]["result"]["tools"]), len(TOOLS))
+                    self.assertEqual(replies[1][2]["error"]["code"], -32600)
+                else:
+                    self.assertEqual(len(replies), 3)
+                    self.assertTrue(all(reply["error"]["code"] == -32600 for reply in replies[1:]))
+
+    def test_blank_lines_between_newline_messages_are_ignored(self):
+        source, output = io.BytesIO(b"\n\r\n" + b'{"jsonrpc":"2.0","id":5,"method":"ping"}\n\n'), io.BytesIO()
+        self.assertEqual(serve(self.service, source, output), 0)
+        self.assertEqual(json.loads(output.getvalue())["id"], 5)
+
+    def test_malformed_newline_json_is_answered_in_the_callers_framing(self):
+        source = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"method":"ping"}\n{"broken"\n')
+        output = io.BytesIO()
+        self.assertEqual(serve(self.service, source, output), 2)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(json.loads(lines[1])["error"]["code"], -32700)
+
+
+def project_version():
+    import tomllib
+    with open(Path(__file__).resolve().parents[1] / "pyproject.toml", "rb") as handle:
+        return tomllib.load(handle)["project"]["version"]
+
+
+class AccountSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.registry = AccountRegistry(self.root / "accounts.json")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def register(self, platform, account):
+        session = self.root / f"{platform}-{account}.json"
+        session.write_text("{}")
+        session.chmod(0o600)
+        self.registry.register(platform=platform, account=account, kind="instagrapi_settings", session_file=session)
+
+    def resolve(self, explicit=None, environ=None):
+        return resolve_account(explicit, environ=environ or {}, registry_factory=lambda: self.registry)
+
+    def test_explicit_and_environment_accounts_win(self):
+        self.assertEqual(self.resolve("not_registered_yet"), "not_registered_yet")
+        self.assertEqual(self.resolve(environ={"SOCIAL_FARM_IG_ACCOUNT": "from_env"}), "from_env")
+        self.assertEqual(self.resolve("flag", {"SOCIAL_FARM_IG_ACCOUNT": "from_env"}), "flag")
+        with self.assertRaisesRegex(AccountSelectionError, "Instagram handle"):
+            self.resolve("@not a handle")
+
+    def test_the_only_registered_instagram_account_is_used(self):
+        with self.assertRaises(AccountSelectionError) as raised:
+            self.resolve()
+        self.assertIn("login start --platform instagram", raised.exception.hint)
+        self.register("threads", "threads_only")
+        with self.assertRaisesRegex(AccountSelectionError, "no Instagram account"):
+            self.resolve()
+        self.register("instagram", "only_one")
+        self.assertEqual(self.resolve(), "only_one")
+        self.register("instagram", "second")
+        with self.assertRaisesRegex(AccountSelectionError, "only_one, second") as raised:
+            self.resolve()
+        self.assertIn("--account", raised.exception.hint)
+
+    def test_placeholders_are_refused_unless_really_registered(self):
+        for handle in ("example_creator", "YOUR_HANDLE"):
+            with self.assertRaisesRegex(AccountSelectionError, "placeholder"):
+                self.resolve(handle)
+            with self.assertRaisesRegex(AccountSelectionError, "placeholder"):
+                self.resolve(environ={"SOCIAL_FARM_IG_ACCOUNT": handle})
+        self.register("instagram", "example_creator")
+        self.assertEqual(self.resolve("example_creator"), "example_creator")
+
+    def test_unreadable_registry_is_reported_without_contents(self):
+        self.registry.path.write_text('{"schema": 99, "secret": "private_sentinel"}')
+        with self.assertRaises(AccountSelectionError) as raised:
+            self.resolve()
+        self.assertNotIn("private_sentinel", str(raised.exception) + raised.exception.hint)
+        self.assertIn("doctor", raised.exception.hint)
+
+    def test_server_refuses_to_start_without_a_resolvable_account(self):
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in ("SOCIAL_FARM_IG_ACCOUNT", "SOCIAL_FARM_IG_PYTHON")}
+        environment.update(SOCIAL_FARM_ACCOUNTS_FILE=str(self.registry.path), HOME=str(self.root))
+        for arguments, expected in (([], "no Instagram account"), (["--account", "example_creator"], "placeholder")):
+            with self.subTest(arguments=arguments):
+                process = subprocess.run([sys.executable, "scripts/instagram_mcp.py", *arguments],
+                    input=b'{"jsonrpc":"2.0","id":1,"method":"ping"}\n', capture_output=True, timeout=15,
+                    env=environment, cwd=Path(__file__).resolve().parents[1])
+                self.assertEqual(process.returncode, 2)
+                self.assertEqual(process.stdout, b"")
+                self.assertIn(expected, process.stderr.decode())
+                self.assertIn("hint:", process.stderr.decode())
+
+
+class ToolCatalogTests(unittest.TestCase):
+    def test_catalog_summarizes_every_tool_with_required_parameters(self):
+        entries = tool_catalog()
+        self.assertEqual([entry["name"] for entry in entries], [item["name"] for item in TOOLS])
+        by_name = {entry["name"]: entry for entry in entries}
+        self.assertEqual(by_name["instagram_draft_reply"]["required"], ["comment_id", "text", "worker"])
+        self.assertEqual(by_name["instagram_status"]["optional"], ["live_check"])
+        self.assertEqual(by_name["instagram_status"]["description"],
+                         "Check configured Instagram account, local session readiness and job counts.")
+        for entry in entries:
+            self.assertNotIn("\n", entry["description"])
+            self.assertTrue(entry["description"].endswith("."))
+
+    def test_substack_tools_are_read_from_source_without_importing_the_extra(self):
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "server.py"
+            source.write_text('import substack_mcp\n\n@mcp.tool()\ndef connection_status() -> dict:\n'
+                              '    """Read setup. More detail."""\n\n@mcp.tool()\n'
+                              'def lookup(slug, *, limit=5, mode):\n    """Find a post."""\n\n'
+                              'def helper():\n    pass\n')
+            tools = substack_catalog(source)
+            self.assertEqual([tool["name"] for tool in tools], ["connection_status", "lookup"])
+            self.assertEqual(tools[0]["description"], "Read setup.")
+            self.assertEqual((tools[1]["required"], tools[1]["optional"]), (["slug", "mode"], ["limit"]))
+            self.assertEqual(substack_catalog(Path(directory) / "missing.py"), [])
+            self.assertEqual([server["server"] for server in catalog(Path(directory) / "missing.py")["servers"]],
+                             ["ghost-in-the-box-instagram"])
+        real = {tool["name"] for tool in substack_catalog()}
+        self.assertIn("connection_status", real)
+
+    def test_markdown_has_one_escaped_row_per_tool(self):
+        data = catalog()
+        markdown = catalog_markdown(data)
+        rows = [line for line in markdown.splitlines() if line.startswith("| `")]
+        self.assertEqual(len(rows), sum(len(server["tools"]) for server in data["servers"]))
+        self.assertIn("| `instagram_publish_job` | Publish a queued job |", markdown)
+        self.assertIn(data["version"], markdown)
+        piped = catalog_markdown({"version": "1", "protocol_versions": ["x"], "servers": [{
+            "server": "s", "command": "c", "tools": [{"name": "t", "title": "a|b", "description": "d",
+                "required": [], "optional": [], "read_only": True, "contacts_provider": False}]}]})
+        self.assertIn("| a\\|b |", piped)
+
+    def test_list_tools_command_formats(self):
+        root = Path(__file__).resolve().parents[1]
+        def run(*arguments):
+            process = subprocess.run([sys.executable, "scripts/instagram_mcp.py", "--list-tools", *arguments],
+                                     capture_output=True, timeout=15, cwd=root)
+            self.assertEqual(process.returncode, 0, process.stderr)
+            return process.stdout.decode()
+        self.assertEqual(json.loads(run())["servers"][0]["tools"], tool_catalog())
+        self.assertEqual(json.loads(run("--format", "mcp")), {"tools": TOOLS})
+        self.assertTrue(run("--format", "md").startswith("# MCP tool catalog"))
 
 if __name__ == "__main__":
     unittest.main()

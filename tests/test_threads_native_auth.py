@@ -11,7 +11,8 @@ from unittest.mock import patch
 
 from farm import threads_auth, threads_native_auth as native
 from farm.instagram_session import _persist_rotated_settings
-from scripts import threads_native_login as cli
+from farm.accounts import AccountRegistry
+from scripts import threads_agent
 
 
 TOKEN = "IGT:2:" + "A" * 40 + "/+="
@@ -331,32 +332,62 @@ class NativeAuthTests(unittest.TestCase):
         self.assertEqual(self.destination.read_bytes(), before)
         self.assertEqual(list(self.auth_dir.iterdir()), [self.destination])
 
+    def mobile_cli(self, argv, run, stdin=None):
+        registry = AccountRegistry(self.root / "accounts.json")
+        for platform in ("instagram", "threads"):
+            registry.register(platform=platform, account="mine", kind="instagrapi_settings",
+                              session_file=self.session, account_key="meta:mine")
+        agent = threads_agent.ThreadsAgent(registry=registry, db=self.root / "outbox.sqlite3",
+                                           auth_dir=self.auth_dir, reader=object())
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(threads_agent, "ThreadsAgent", return_value=agent), \
+                patch.object(threads_agent, "load_inputs", return_value=self.inputs), \
+                patch.object(threads_agent, "native_mobile_login", side_effect=run), \
+                patch.object(threads_agent.sys, "stdin", stdin or io.StringIO("")), \
+                redirect_stdout(output), redirect_stderr(errors):
+            status = threads_agent.main(["--account", "mine", "mobile-login", "--native", *argv])
+        return status, json.loads(output.getvalue()), errors.getvalue()
+
     def test_cli_reads_one_code_only_when_challenged_and_prints_no_secrets(self):
         http = Http(Response(CHALLENGE), Response(success()))
         def run(inputs, **kwargs):
-            return native.login(inputs, http=http, auth_dir=self.auth_dir, **kwargs)
-        output, errors, stdin = io.StringIO(), io.StringIO(), io.StringIO("123456\nunused\n")
-        with patch.object(cli, "load_inputs", return_value=self.inputs), \
-                patch.object(cli, "login", side_effect=run), patch.object(cli.sys, "stdin", stdin), \
-                redirect_stdout(output), redirect_stderr(errors):
-            status = cli.main(["--verification-code-stdin"])
+            return native.login(inputs, http=http, **kwargs)
+        stdin = io.StringIO("123456\nunused\n")
+        status, result, errors = self.mobile_cli(["--verification-code-stdin"], run, stdin)
         self.assertEqual(status, 0)
-        self.assertEqual(json.loads(output.getvalue()),
-                         {"ok": True, "status": "saved", "needs_code": False})
-        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual((result["ok"], result["status"], result["needs_code"]),
+                         (True, "saved", False))
+        self.assertEqual(errors, "")
         self.assertEqual(stdin.read(), "unused\n")
+        self.assertTrue(self.destination.is_file())
+        self.assertNotIn(TOKEN, json.dumps(result))
 
     def test_cli_failed_request_has_only_a_fixed_public_status(self):
-        output = io.StringIO()
         def run(inputs, **kwargs):
-            return self.login(Http(RuntimeError("private-password private-provider-body")), **kwargs)
-        with patch.object(cli, "load_inputs", return_value=self.inputs), \
-                patch.object(cli, "login", side_effect=run), redirect_stdout(output):
-            status = cli.main([])
+            return self.login(Http(RuntimeError("private-password private-provider-body")),
+                              code_provider=kwargs.get("code_provider"))
+        status, result, _ = self.mobile_cli([], run)
         self.assertEqual(status, 1)
-        self.assertEqual(json.loads(output.getvalue()),
-                         {"ok": False, "status": "request_failed", "needs_code": False})
+        self.assertEqual((result["ok"], result["status"], result["needs_code"]),
+                         (False, "request_failed", False))
+        self.assertEqual(result["error"]["code"], "request_failed")
+        self.assertNotIn("private", json.dumps(result))
 
+    def test_cli_rejects_credentials_for_another_account(self):
+        other = replace(self.inputs, username="someone")
+        output = io.StringIO()
+        registry = AccountRegistry(self.root / "accounts.json")
+        for platform in ("instagram", "threads"):
+            registry.register(platform=platform, account="mine", kind="instagrapi_settings",
+                              session_file=self.session, account_key="meta:mine")
+        agent = threads_agent.ThreadsAgent(registry=registry, auth_dir=self.auth_dir, reader=object())
+        with patch.object(threads_agent, "ThreadsAgent", return_value=agent), \
+                patch.object(threads_agent, "load_inputs", return_value=other), \
+                patch.object(threads_agent, "native_mobile_login") as login, redirect_stdout(output):
+            status = threads_agent.main(["--account", "mine", "mobile-login", "--native"])
+        self.assertEqual(status, 4)
+        self.assertEqual(json.loads(output.getvalue())["status"], "credentials_account_mismatch")
+        login.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

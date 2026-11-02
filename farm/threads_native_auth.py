@@ -30,7 +30,7 @@ SOFTWARE.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import fcntl
+from farm import locking as fcntl
 import json
 import os
 from pathlib import Path

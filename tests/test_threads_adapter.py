@@ -6,11 +6,17 @@ import unittest
 from urllib.parse import parse_qs
 
 import requests
+from urllib3.exceptions import NewConnectionError
 
+import farm.adapters as shared
 from farm.accounts import AccountRegistry
-from farm.adapters.threads import AuthUnavailable, ThreadsAdapter, PreSendFailure, PublishUncertain
+from farm.adapters.threads import (
+    AuthUnavailable, PreSendFailure, PublishRejected, PublishUncertain, ThreadsAdapter,
+    ThreadsReadFailure,
+)
 from farm.outbox import Outbox
 from farm.threads_auth import ThreadsToken, save_token
+from _env import IsolatedStateTestCase
 
 
 class Response:
@@ -75,8 +81,9 @@ class FakeClient:
         return {"destination_id": "123", "username": "mine"}
 
 
-class ThreadsAdapterTests(unittest.TestCase):
+class ThreadsAdapterTests(IsolatedStateTestCase):
     def setUp(self):
+        super().setUp()
         self.temp = TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.session = self.root / "session.json"
@@ -169,6 +176,48 @@ class ThreadsAdapterTests(unittest.TestCase):
         self.assertEqual(len(http.gets), 1)
         self.assertTrue(http.gets[0].endswith("/text_post_app_timeline/"))
 
+    def test_publish_asks_threads_who_the_bearer_belongs_to_before_writing(self):
+        self.assertIs(ThreadsAdapter.LIVE_IDENTITY_CHECK, True)
+        identity = "https://i.instagram.com/api/v1/accounts/current_user/"
+
+        class OrderedHTTP(FakeHTTP):
+            def post(self, url, **kwargs):
+                if identity not in self.gets:
+                    raise AssertionError("wrote before the identity check")
+                return super().post(url, **kwargs)
+        http = OrderedHTTP()
+        self.adapter(http).publish(self.job())
+        self.assertEqual(len(http.posts), 1)
+
+    def test_bearer_for_another_account_is_a_pre_send_failure(self):
+        class OtherAccountHTTP(FakeHTTP):
+            def get(self, url, **kwargs):
+                if url.startswith("https://i.instagram.com/") and url.endswith("/accounts/current_user/"):
+                    self.gets.append(url)
+                    return Response(data={"status": "ok", "user": {"pk": 999, "username": "someone_else"}})
+                return super().get(url, **kwargs)
+        http = OtherAccountHTTP()
+        with self.assertRaisesRegex(PreSendFailure, "different account") as caught:
+            self.adapter(http).publish(self.job())
+        self.assertNotIsInstance(caught.exception, AuthUnavailable)
+        self.assertEqual(http.posts, [])
+
+    def test_rejected_or_throttled_identity_check_keeps_the_job_queued(self):
+        for status, reason in ((401, "bearer_rejected"), (429, "HTTP 429")):
+            with self.subTest(status=status):
+                class RefusingHTTP(FakeHTTP):
+                    def get(self, url, **kwargs):
+                        if url.startswith("https://i.instagram.com/") and url.endswith("/accounts/current_user/"):
+                            self.gets.append(url)
+                            return Response(status_code=status)
+                        return super().get(url, **kwargs)
+                http = RefusingHTTP()
+                job = self.job()
+                with self.assertRaisesRegex(AuthUnavailable, reason):
+                    self.adapter(http).publish(job)
+                self.assertEqual(http.posts, [])
+                self.box.release(job["id"], job["lease_token"])
+
     def test_login_required_payload_never_starts_write(self):
         class LoggedOutHTTP(FakeHTTP):
             def get(self, url, **kwargs):
@@ -214,6 +263,64 @@ class ThreadsAdapterTests(unittest.TestCase):
         with self.assertRaises(PublishUncertain):
             self.adapter(http).publish(self.job())
         self.assertEqual(len(http.posts), 1)
+
+    def test_exceptions_are_the_shared_adapter_contract(self):
+        self.assertIs(PreSendFailure, shared.PreSendFailure)
+        self.assertIs(AuthUnavailable, shared.AuthUnavailable)
+        self.assertIs(PublishUncertain, shared.PublishUncertain)
+        self.assertTrue(issubclass(ThreadsReadFailure, shared.ReadFailure))
+        self.assertIsInstance(self.adapter(FakeHTTP()), shared.PublishingAdapter)
+        self.assertIsInstance(self.adapter(FakeHTTP()), shared.IdentityAdapter)
+
+    def test_definite_client_error_from_configure_is_rejected(self):
+        for status in (400, 403, 422, 429):
+            with self.subTest(status=status):
+                with self.assertRaises(PublishRejected) as caught:
+                    self.adapter(FakeHTTP(post_status=status)).publish(self.job())
+                self.assertEqual(caught.exception.status_code, status)
+                self.box.db.execute("UPDATE jobs SET status='failed' WHERE status='in_flight'")
+
+    def test_timeout_conflict_and_unreadable_answers_stay_uncertain(self):
+        class Unreadable(FakeHTTP):
+            def post(self, url, **kwargs):
+                self.posts.append((url, kwargs))
+                response = Response()
+                response.json = lambda: (_ for _ in ()).throw(ValueError("not json"))
+                return response
+
+        class Slow(FakeHTTP):
+            def post(self, url, **kwargs):
+                self.posts.append((url, kwargs))
+                raise requests.ReadTimeout("PRIVATE")
+
+        for http in (FakeHTTP(post_status=408), FakeHTTP(post_status=409), Unreadable(), Slow()):
+            with self.subTest(http=type(http).__name__, status=http.post_status):
+                with self.assertRaises(PublishUncertain) as caught:
+                    self.adapter(http).publish(self.job())
+                self.assertNotIn("PRIVATE", str(caught.exception))
+                self.box.db.execute("UPDATE jobs SET status='failed' WHERE status='in_flight'")
+
+    def test_job_queued_under_a_legacy_threads_key_still_publishes(self):
+        self.registry.register(platform="threads", account="mine", account_key="threads:mine",
+                               kind="instagrapi_settings", session_file=self.session)
+        job = self.job()
+        self.box.db.execute("UPDATE jobs SET account_key='threads:mine' WHERE id=?", (job["id"],))
+        job["account_key"] = "threads:mine"
+        http = FakeHTTP()
+        self.assertEqual(self.adapter(http).publish(job)["provider_id"], "999")
+        job["account_key"] = "threads:someone-else"
+        with self.assertRaisesRegex(PreSendFailure, "account key"):
+            self.adapter(FakeHTTP()).publish(job)
+
+    def test_connection_never_opened_is_pre_send(self):
+        class Offline(FakeHTTP):
+            def post(self, url, **kwargs):
+                self.posts.append((url, kwargs))
+                raise requests.ConnectionError(NewConnectionError(None, "connection refused"))
+
+        with self.assertRaisesRegex(PreSendFailure, "never left") as caught:
+            self.adapter(Offline()).publish(self.job())
+        self.assertNotIsInstance(caught.exception, PublishRejected)
 
 
 if __name__ == "__main__":

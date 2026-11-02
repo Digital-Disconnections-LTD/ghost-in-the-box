@@ -1,5 +1,5 @@
 include LICENSE THIRD_PARTY_NOTICES.md ARCHITECTURE.md CONTRIBUTING.md SECURITY.md AGENTS.md
 recursive-include docs *.md *.txt *.png
-recursive-include examples *.json
+recursive-include examples *.json *.md
 recursive-include systemd *.service *.timer
 recursive-include tools *.py

@@ -1,8 +1,9 @@
-# The next season 🌙
+# The next season 🌙 (roadmap)
 
 Ghost in the Box is a community project for local, source-linked social workflows.
-The same loop connects each lane: account reference → observed conversation →
-draft → frozen job → delivery receipt → read-back.
+The same loop connects each lane (target platform): account reference → observed
+conversation → draft → frozen job → delivery receipt → read-back. Terms are in
+[plain terms](glossary.md).
 
 ## Available foundation
 
@@ -15,7 +16,14 @@ draft → frozen job → delivery receipt → read-back.
 - Substack SDK/MCP integration with persistent session cookies and compact
   publication receipts.
 - A source-linked brief engine with platform-specific formats.
-- One CLI, isolated offline tests, and a configurable local state root.
+- One CLI with grouped help, `doctor` and `config`, isolated offline tests, and a
+  configurable local state root.
+- Exact-job publishing with `publish --dry-run` previews and `publish --due` for
+  timers; Threads posts and replies queue by default.
+- Instagram and Substack MCP servers for Claude Desktop, Claude Code, Batbox and
+  other standard clients.
+- Cross-platform browser sign-in and selected-session export/import; experimental
+  LinkedIn identity/reads and text-only outbox delivery.
 
 Provider authentication is established by the operator's own live account
 checks. This plan contains no saved accounts or claims about a private
@@ -27,11 +35,13 @@ deployment's current connectivity.
    including account identity, expired sessions, and recovery.
 2. **A friendly conversation workspace.** Show inbox context, drafts, account
    state, delivery receipts, and uncertain jobs over the existing stores.
-3. **More adapters.** Add LinkedIn, Facebook, TikTok, and YouTube delivery paths
+3. **More adapters.** Add Facebook, TikTok, and YouTube delivery paths
    one at a time with provider receipts and restart recovery tests. Their brief
-   formats already exist; their publishers do not.
+   formats already exist; their publishers do not. Verify and extend the
+   experimental LinkedIn adapter against real provider accounts.
 4. **Better context for agents.** Improve source-linked voice corpora, reply
-   context, and the handoff to Batbox or another coordinator.
+   context, and the handoff to Batbox or another coordinator. Threads and
+   LinkedIn are CLI-only today; MCP tools for them would help agents.
 5. **More real platform acceptance.** Test fresh installations, optional browser
    dependencies, account setup, and provider changes on supported systems.
 

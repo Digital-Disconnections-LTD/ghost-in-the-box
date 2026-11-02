@@ -10,10 +10,11 @@ import unittest
 from unittest.mock import patch
 
 from farm.accounts import AccountRegistry
-from farm.instagram_mcp import InstagramTools, TOOLS, ToolInputError, dispatch
+from farm.instagram_mcp import InstagramTools, ToolInputError, dispatch
 from farm.instagram_references import ReferenceError
 from farm.outbox import Outbox
 from scripts import meme_library
+from _env import IsolatedStateTestCase
 
 try:
     from PIL import Image
@@ -22,8 +23,9 @@ except ImportError:
 
 
 @unittest.skipUnless(Image, "Pillow runtime required (~/.venvs/iglib/bin/python)")
-class InstagramMemeToolTests(unittest.TestCase):
+class InstagramMemeToolTests(IsolatedStateTestCase):
     def setUp(self):
+        super().setUp()
         self.temporary = TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
         self.library = self.root / "library"

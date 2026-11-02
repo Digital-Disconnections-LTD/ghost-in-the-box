@@ -8,9 +8,10 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
-from farm.adapters.threads import AuthUnavailable, PreSendFailure, PublishUncertain
+from farm.adapters.threads import AuthUnavailable, PublishUncertain
 from farm.threads_browser import BrowserThreadsAdapter
 from farm.threads_scrapling import ProfileBusy, ScraplingThreadsAdapter, verified_profile
+from farm.threads_transport import ThreadsDependencyUnavailable
 from scripts import threads_scrapling_bridge as bridge
 from scripts import threads_scrapling_login as login
 
@@ -353,6 +354,68 @@ class ScraplingPublishTests(unittest.TestCase):
         expand.click.assert_called_once_with(timeout=10000, no_wait_after=True)
         editor.fill.assert_called_once_with(self.job["body"])
         button.click.assert_called_once_with(timeout=10000, no_wait_after=True)
+
+
+
+class ScraplingDependencyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        account_dir = login.private_dir(self.root / "mine")
+        login.private_dir(account_dir / "profile")
+        login.save_json(account_dir / "verified-cookies.json", {
+            "version": 1, "account": "mine", "cookies": []})
+        body = "Exact approved text"
+        self.job = {"id": "exact-job", "platform": "threads", "account": "mine",
+                    "account_key": "meta:mine", "action": "post", "body": body,
+                    "body_sha256": hashlib.sha256(body.encode()).hexdigest(),
+                    "media_path": None, "media_sha256": None}
+        self.python = self.root / "python"
+        self.python.touch()
+
+    def adapter(self, stdout, python=None):
+        runner = Mock(return_value=subprocess.CompletedProcess([], 2, stdout, ""))
+        return ScraplingThreadsAdapter(registry=Registry(), runner=runner, state_dir=self.root,
+                                       python=python or self.python,
+                                       sleep=lambda seconds: None), runner
+
+    def test_bridge_dependency_report_is_a_dependency_error_not_uncertain(self):
+        adapter, _ = self.adapter('{"status":"dependency_unavailable","dependency":"scrapling"}')
+        with self.assertRaises(ThreadsDependencyUnavailable) as raised:
+            adapter.publish(self.job)
+        self.assertEqual(raised.exception.dependency, "scrapling")
+        self.assertIn(str(self.python), raised.exception.install)
+        self.assertIn("[browser]", raised.exception.install)
+        self.assertIn("scrapling install", raised.exception.install)
+
+    def test_reads_keep_the_dependency_error_instead_of_a_generic_read_failure(self):
+        adapter, _ = self.adapter('{"status":"dependency_unavailable","dependency":"scrapling"}')
+        with self.assertRaises(ThreadsDependencyUnavailable):
+            adapter.read("mine", "own")
+
+    def test_missing_runtime_python_is_named_without_running_anything(self):
+        adapter, runner = self.adapter("{}", python=self.root / "missing-python")
+        with self.assertRaises(ThreadsDependencyUnavailable) as raised:
+            adapter.publish(self.job)
+        self.assertEqual(raised.exception.dependency, "python")
+        runner.assert_not_called()
+
+    def test_bridge_reports_missing_scrapling_before_any_browser(self):
+        command = {"mode": "read", "account": "mine", "operation": "own", "limit": 1,
+                   "post_id": "", "target_url": ""}
+        with patch.dict(os.environ, {"SOCIAL_FARM_THREADS_SCRAPLING_STATE": str(self.root)}), \
+                patch.dict("sys.modules", {"scrapling": None, "scrapling.fetchers": None}):
+            result = bridge.run(command)
+        self.assertEqual(result, {"status": "dependency_unavailable", "dependency": "scrapling"})
+
+    def test_login_reports_missing_scrapling_with_install_command(self):
+        args = Mock(mode="diagnose", account="mine", headed=False, screenshot=False)
+        with patch.dict("sys.modules", {"scrapling": None, "scrapling.fetchers": None}):
+            result = login.browser_run(args, self.root / "mine" / "profile", self.root / "mine")
+        self.assertEqual((result["status"], result["dependency"]),
+                         ("dependency_unavailable", "scrapling"))
+        self.assertIn("scrapling install", result["install"])
 
 
 if __name__ == "__main__":

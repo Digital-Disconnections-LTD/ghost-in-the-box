@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "ghost-in-the-box-instagram": {
+      "type": "stdio",
+      "command": "/absolute/path/to/ghost-in-the-box/.venv/bin/ghost-in-the-box",
+      "args": ["instagram-mcp", "--account", "YOUR_HANDLE"]
+    },
+    "ghost-in-the-box-substack": {
+      "type": "stdio",
+      "command": "/absolute/path/to/ghost-in-the-box/.venv/bin/ghost-in-the-box",
+      "args": ["substack-mcp", "--account", "YOUR_SUBSTACK_HANDLE"]
+    }
+  }
+}

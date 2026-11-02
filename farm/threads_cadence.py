@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from farm.config import STATE_ROOT
+from farm.config import threads_cadence_dir
+from farm.session_files import is_private, protect_descriptor
 
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-import fcntl
+from farm import locking as fcntl
 import json
 import os
 from pathlib import Path
@@ -18,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 
 NEW_YORK = ZoneInfo("America/New_York")
-DEFAULT_CADENCE_DIR = STATE_ROOT / 'threads-cadence'
+DEFAULT_CADENCE_DIR = threads_cadence_dir()
 _ACCOUNT = re.compile(r"[A-Za-z0-9._]+\Z")
 MIN_POST_GAP = 3600
 MAX_POST_GAP = 7200
@@ -26,6 +27,12 @@ MAX_POST_GAP = 7200
 
 class CadenceError(Exception):
     """Local cadence state cannot safely be used."""
+
+
+def _lock_owner_only(fd: int) -> None:
+    # The lock file holds nothing; skip a per-call icacls run on native Windows.
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, 0o600)
 
 
 def in_quiet_hours(now: datetime) -> bool:
@@ -62,7 +69,7 @@ class ThreadsCadence:
         os.chmod(self.directory, 0o700)
         fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            os.fchmod(fd, 0o600)
+            _lock_owner_only(fd)
             fcntl.flock(fd, fcntl.LOCK_EX)
             self._locked = True
             yield self
@@ -79,7 +86,7 @@ class ThreadsCadence:
         self._require_lock()
         if not self.path.exists():
             return None
-        if self.path.is_symlink() or self.path.stat().st_mode & 0o077:
+        if self.path.is_symlink() or not is_private(self.path):
             raise CadenceError("cadence file is not private")
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -115,7 +122,7 @@ class ThreadsCadence:
         fd, temporary = tempfile.mkstemp(prefix=".threads-cadence-", dir=self.directory)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                os.fchmod(handle.fileno(), 0o600)
+                protect_descriptor(handle.fileno(), Path(temporary))
                 json.dump(data, handle, separators=(",", ":"))
                 handle.write("\n")
                 handle.flush()

@@ -3,9 +3,7 @@
 
 The brief records sources, dates, lane limits, and content hashes. Its output
 is an editorial artifact, rather than evidence that a post was delivered.
-Review a body file, then stage it through the existing outbox or Substack tools.
-
-Run ghost-in-the-box brief --help for topic-pack fields and platform formats.
+Review a body file, then stage it through the outbox or the Substack tools.
 """
 
 from __future__ import annotations
@@ -19,7 +17,26 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from farm.cli_output import guarded
+
 SCHEMA = 1
+COMMAND = "brief"
+# Lanes the outbox can publish; the rest are briefs you post yourself.
+OUTBOX_LANES = ("threads", "instagram", "linkedin")
+EPILOG = """\
+Topic pack (--json FILE): a JSON object; see examples/topic-pack.json.
+  schema   1
+  title    the topic, one line
+  why      list of dated, cited "why now" facts (at least one)
+  angle    list of on-mission turns (at least one)
+  hooks    list of candidate lead lines
+  sources  list of {"label", "url", "date"?, "claim"?}
+  lanes    list of: threads, instagram, linkedin, facebook, tiktok, youtube, substack
+  voice    list of voice notes
+  drafts   object of LANE: proposed body text
+Flags add to the pack's lists. Example:
+  ghost-in-the-box brief --json examples/topic-pack.json --out out/demo --emit
+"""
 
 # A lane's default format + cap; the author's voice rules are carried on the pack.
 LANES = {
@@ -53,6 +70,15 @@ def _load_json_pack(path: str) -> dict:
     if pack.get("schema", SCHEMA) not in (SCHEMA,):
         sys.stderr.write(f"[buzz] warning: unexpected topic-pack schema {pack.get('schema')}\n")
     return pack
+
+
+class BriefInputError(ValueError):
+    """A topic pack that cannot become a brief; the message says what is missing."""
+
+    def __init__(self, message: str, *, code: str, hint: str):
+        super().__init__(message)
+        self.code = code
+        self.hint = hint
 
 
 def _merge_pack(args) -> dict:
@@ -125,10 +151,15 @@ def render(pack: dict) -> tuple[str, dict, list[dict]]:
     title = (pack.get("title") or "Untitled topic").strip()
     ts = _utc()
     slug = _slug(pack.get("slug") or pack.get("draft_slug") or title)
-    lanes = [L.lower() for L in pack.get("lanes", []) if L.lower() in LANES]
+    requested = [str(L).lower() for L in pack.get("lanes", [])]
+    unknown = [L for L in requested if L not in LANES]
+    if unknown:
+        raise BriefInputError(f"unknown lane {', '.join(unknown)}; lanes are: {', '.join(LANES)}",
+                              code="unknown_lane", hint="use --lane with one of: " + ", ".join(LANES))
+    lanes = list(dict.fromkeys(requested))
     if not lanes:
-        sys.stderr.write("[buzz] at least one known --lane is required (threads, instagram, ...)\n")
-        sys.exit(2)
+        raise BriefInputError("at least one lane is required", code="lane_required",
+                              hint="add --lane threads (or set \"lanes\" in the topic pack)")
     why = [w.strip() for w in pack.get("why", []) if w and w.strip()]
     angles = [a.strip() if isinstance(a, str) else str(a) for a in pack.get("angle", []) if a and str(a).strip()]
     hooks = [h.strip() for h in pack.get("hooks", []) if h and h.strip()]
@@ -137,11 +168,11 @@ def render(pack: dict) -> tuple[str, dict, list[dict]]:
     drafts = pack.get("drafts", {}) or {}
 
     if not why:
-        sys.stderr.write("[buzz] at least one dated --why fact is required (the 'why now')\n")
-        sys.exit(2)
+        raise BriefInputError("at least one dated 'why now' fact is required", code="why_required",
+                              hint="add --why 'DATE: what happened (source)' or a \"why\" list in the pack")
     if not angles:
-        sys.stderr.write("[buzz] at least one --angle (the on-mission turn) is required\n")
-        sys.exit(2)
+        raise BriefInputError("at least one angle (the on-mission turn) is required", code="angle_required",
+                              hint="add --angle TEXT or an \"angle\" list in the pack")
 
     lines: list[str] = []
     lines.append(f"# Brief — {title}")
@@ -286,33 +317,65 @@ def _hashtags_for(lane: str, tokens: list[str]) -> list[str]:
     return out
 
 
+def next_steps(staging: dict, sources: list[dict]) -> list[str]:
+    """The commands to run after reviewing the emitted body files, ready to paste."""
+    source_args = "".join(" --source-url " + shlex.quote(source["url"])
+                          for source in sources if source.get("url"))
+    lines = ["", "After reviewing a body file, save it as a local draft (nothing is sent):"]
+    brief_only = []
+    for lane, body_path in staging.items():
+        body = shlex.quote(body_path)
+        if lane == "substack":
+            lines.append(f"  Substack: use the substack-mcp draft tools with {body}")
+        elif lane == "instagram":
+            lines.append(f"  ghost-in-the-box outbox draft --platform instagram --account YOUR_HANDLE "
+                         f"--body-file {body} --media YOUR_IMAGE.jpg{source_args}")
+            lines.append("    (Instagram needs an image; for 2-10 slides use: ghost-in-the-box carousel draft --help)")
+        elif lane in OUTBOX_LANES:
+            lines.append(f"  ghost-in-the-box outbox draft --platform {lane} --account YOUR_HANDLE "
+                         f"--body-file {body}{source_args}")
+        else:
+            brief_only.append(f"  {LANES[lane]['label']}: post {body} yourself (brief-only platform)")
+    lines += brief_only
+    if any(lane in OUTBOX_LANES for lane in staging):
+        lines += ["Then find its JOB_ID, preview exactly what would be sent (sends nothing), "
+                  "and queue only the draft you chose:",
+                  "  ghost-in-the-box outbox list",
+                  "  ghost-in-the-box publish --dry-run JOB_ID",
+                  "  ghost-in-the-box outbox queue JOB_ID"]
+    return lines
+
+
+@guarded(COMMAND)
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
+        epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        add_help=True,
     )
-    ap.add_argument("--json", help="topic-pack JSON file")
-    ap.add_argument("--title", help="inline topic")
-    ap.add_argument("--why", action="append", help="dated, cited 'why now' fact (repeat)")
-    ap.add_argument("--angle", action="append", help="the on-mission turn (repeat)")
-    ap.add_argument("--hook", action="append", help="candidate lead line (repeat)")
-    ap.add_argument("--source", action="append", help="LABEL=URL (or bare URL), repeat")
-    ap.add_argument("--claim", action="append", help="CLAIM pairs positionally to the newest --source")
-    ap.add_argument("--lane", action="append", help="a target lane: threads|instagram|linkedin|facebook|tiktok|youtube|substack")
-    ap.add_argument("--voice", action="append", help="voice constraint note (repeat)")
-    ap.add_argument("--draft", action="append", help="LANE=TEXT proposed body (repeat)")
-    ap.add_argument("--draft-slug", dest="slug", help="filename slug words")
-    ap.add_argument("--out", default=None, help="output dir (default <repo>/out/briefs)")
+    ap.add_argument("--json", metavar="FILE", help="topic-pack JSON file (format below)")
+    ap.add_argument("--title", metavar="TEXT", help="inline topic")
+    ap.add_argument("--why", action="append", metavar="TEXT", help="dated, cited 'why now' fact (repeat)")
+    ap.add_argument("--angle", action="append", metavar="TEXT", help="the on-mission turn (repeat)")
+    ap.add_argument("--hook", action="append", metavar="TEXT", help="candidate lead line (repeat)")
+    ap.add_argument("--source", action="append", metavar="LABEL=URL", help="source link, or a bare URL (repeat)")
+    ap.add_argument("--claim", action="append", metavar="TEXT",
+                    help="the claim a source supports; the Nth --claim goes with the Nth source")
+    ap.add_argument("--lane", action="append", metavar="LANE", help="target lane, repeatable: " + ", ".join(LANES))
+    ap.add_argument("--voice", action="append", metavar="TEXT", help="voice constraint note (repeat)")
+    ap.add_argument("--draft", action="append", metavar="LANE=TEXT", help="proposed body for one lane (repeat)")
+    ap.add_argument("--draft-slug", dest="slug", metavar="WORDS", help="filename slug words")
+    ap.add_argument("--out", default=None, metavar="DIR", help="output directory (default ./out/briefs)")
     ap.add_argument("--emit", action="store_true", help="also write per-lane .body staging files")
-    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--quiet", action="store_true", help="print one tab-separated summary line")
     args = ap.parse_args(argv)
 
     pack = _merge_pack(args)
 
     brief_text, receipt, lane_receipts = render(pack)
     ts_compact = datetime.now(timezone.utc).strftime("%Y%m%d")
-    out = Path(args.out) if args.out else (Path(__file__).resolve().parent.parent / "out" / "briefs")
+    # A pip install has no repository, so the default lives under the working directory.
+    out = Path(args.out) if args.out else Path.cwd() / "out" / "briefs"
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
     base = f"{ts_compact}-{receipt['slug']}"
     brief_path = out / f"{base}.brief.md"
@@ -346,16 +409,9 @@ def main(argv=None) -> int:
         for L in staging.values():
             print(f"  staging    : {L}")
         if staging:
-            print("\nAfter reviewing a body file, create a local draft:")
-            source_args = "".join(" --source-url " + shlex.quote(source["url"])
-                                  for source in receipt["sources"] if source.get("url"))
-            for lane, body_path in staging.items():
-                if lane == "substack":
-                    print(f"  Use the Substack MCP draft tools with {body_path}")
-                else:
-                    print(f"  ghost-in-the-box outbox draft --platform {lane} --account YOUR_HANDLE "
-                          f"--body-file {shlex.quote(body_path)}{source_args}")
-            print("Queue only the chosen draft: ghost-in-the-box outbox queue JOB_ID")
+            print("\n".join(next_steps(staging, receipt["sources"])))
+        else:
+            print("\nAdd --emit to write per-lane body files you can turn into drafts.")
     return 0
 
 

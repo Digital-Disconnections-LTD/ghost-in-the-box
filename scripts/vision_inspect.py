@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Inspect one local image with the on-box vision model; return a compact answer.
+"""Ask your own vision model one question about one local image.
 
-The image bytes go to your configured vision endpoint and are never written to a
-Batbox transcript or the tool's terminal output. Validate an image, encode it as a typed base64 image part, and send its
-question to the configured vision endpoint.
+The image is sent only to the configured OpenAI-compatible endpoint (a local
+server by default) and never printed. Exit codes: 0 ok, 1 runtime failure,
+2 usage.
 """
 
 from __future__ import annotations
@@ -11,12 +11,14 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
-import json
 import os
 from pathlib import Path
 import sys
 
 import requests
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from farm.cli_output import EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, emit, fail
 
 
 API = os.environ.get("SOCIAL_FARM_VISION_URL", "http://127.0.0.1:8001/v1/chat/completions")
@@ -73,24 +75,49 @@ def inspect(path: Path, question: str, *, max_tokens: int = 700,
     }
 
 
+COMMAND = "vision"
+ENDPOINT_HINT = ("start your vision model, or point --endpoint (or SOCIAL_FARM_VISION_URL) at its "
+                 "OpenAI-compatible /v1/chat/completions URL")
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--image", type=Path, required=True)
-    parser.add_argument("--question", default=DEFAULT_QUESTION)
-    parser.add_argument("--max-tokens", type=int, default=700)
-    parser.add_argument("--endpoint", default=API)
-    parser.add_argument("--model", default=MODEL)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Example: ghost-in-the-box vision --image slide.jpg --question 'What does the chart show?'")
+    parser.add_argument("--image", type=Path, required=True, metavar="PATH", help="JPEG, PNG or WebP, up to 8 MB")
+    parser.add_argument("--question", default=DEFAULT_QUESTION, help="what to ask about the image")
+    parser.add_argument("--max-tokens", type=int, default=700, metavar="N", help="64..2000 (default 700)")
+    parser.add_argument("--endpoint", default=API, metavar="URL",
+                        help="chat completions URL (default SOCIAL_FARM_VISION_URL or a local server)")
+    parser.add_argument("--model", default=MODEL, help="model name (default SOCIAL_FARM_VISION_MODEL)")
     args = parser.parse_args(argv)
+    if not 64 <= args.max_tokens <= 2000:
+        parser.error("--max-tokens must be 64..2000")
     try:
-        if not 64 <= args.max_tokens <= 2000:
-            raise ValueError("max-tokens must be 64..2000")
         result = inspect(args.image, args.question, max_tokens=args.max_tokens,
                          endpoint=args.endpoint, model=args.model)
-    except (OSError, ValueError, requests.RequestException, KeyError, IndexError, TypeError) as exc:
-        result = {"ok": False, "error": str(exc)[:300]}
-    print(json.dumps(result, ensure_ascii=False))
-    return 0 if result.get("ok") else 2
+    except FileNotFoundError:
+        return fail("file_not_found", f"image not found: {args.image}", "pass an existing image path with --image",
+                    EXIT_USAGE)
+    except ValueError as exc:
+        return fail("invalid_image", str(exc)[:300], "pass a JPEG, PNG or WebP image under 8 MB", EXIT_USAGE)
+    except requests.RequestException as exc:
+        # requests errors are OSErrors too, so this must come before the file case.
+        return fail("vision_unavailable", f"the vision endpoint did not answer ({type(exc).__name__})",
+                    ENDPOINT_HINT, EXIT_RUNTIME, error_type=type(exc).__name__)
+    except OSError as exc:
+        return fail("image_unreadable", f"{exc.strerror or type(exc).__name__}: {args.image}",
+                    "check the image path and its permissions", EXIT_RUNTIME)
+    except (KeyError, IndexError, TypeError):
+        return fail("vision_unreadable", "the vision endpoint's answer was not a chat completion",
+                    ENDPOINT_HINT, EXIT_RUNTIME)
+    if not result.get("ok"):
+        return fail("empty_answer", "the vision model returned an empty answer",
+                    "ask a more specific --question, or raise --max-tokens", EXIT_RUNTIME,
+                    **{key: value for key, value in result.items() if key != "ok"})
+    emit(result)
+    return EXIT_OK
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

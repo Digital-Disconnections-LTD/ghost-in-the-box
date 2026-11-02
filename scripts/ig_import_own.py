@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import fcntl
+from farm import locking as fcntl
 import hashlib
 import json
 import logging
@@ -22,11 +22,14 @@ import tempfile
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from farm.config import STATE_ROOT
+from farm.cli_output import (
+    EXIT_AUTH, EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, check_account, emit, error_object, exception_failure,
+    failure, guarded,
+)
+from farm.config import STATE_ROOT, install_command
 
 
 DEFAULT_ROOT = STATE_ROOT
-DEFAULT_USERNAME = "example_creator"
 
 
 class ImportFailure(ValueError):
@@ -236,22 +239,91 @@ def corpus_status(directory):
             "backfill_complete": (read_json(directory / "state.json", {}) or {}).get("backfill_complete", False)}
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("import", "status", "list", "show"))
-    parser.add_argument("--username", default=DEFAULT_USERNAME)
-    parser.add_argument("--state-root", type=Path, default=DEFAULT_ROOT)
-    parser.add_argument("--pages", type=int, choices=range(1, 6), default=1)
-    parser.add_argument("--page-size", type=int, choices=range(1, 34), default=12)
+COMMAND = "instagram-import"
+HELP = {
+    "import": "fetch pages of your own captions into the private corpus",
+    "status": "show corpus size and the last import receipt",
+    "list": "show the newest imported captions",
+    "show": "show one imported post by --media-pk",
+}
+# Fixed import refusals and the step that clears each one.
+SESSION_FAILURES = {
+    "saved_session_missing": "session_unavailable",
+    "saved_session_not_private": "session_unavailable",
+    "saved_session_has_no_account": "session_unavailable",
+    "saved_session_account_mismatch": "account_mismatch",
+}
+IMPORT_HINTS = {
+    "post_not_imported": "list imported posts: ghost-in-the-box instagram-import list --account {account}",
+    "show_requires_numeric_media_pk": "ghost-in-the-box instagram-import show --account {account} --media-pk MEDIA_PK",
+    "invalid_import_bounds": "ghost-in-the-box instagram-import --help",
+}
+RETRY_HINT = ("nothing past the last saved page was committed; retry later: "
+              "ghost-in-the-box instagram-import import --account {account}")
+
+
+def _bounded(low: int, high: int):
+    def parse(value: str) -> int:
+        try:
+            number = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"expected a whole number {low}..{high}") from None
+        if not low <= number <= high:
+            raise argparse.ArgumentTypeError(f"must be {low}..{high}")
+        return number
+    return parse
+
+
+def _import_error(code: str, account: str, session_file: Path) -> dict:
+    session_code = SESSION_FAILURES.get(code)
+    if session_code:
+        from farm.instagram_session import InstagramSessionError
+        details = {
+            "saved_session_missing": f"No saved Instagram session at {session_file}.",
+            "saved_session_not_private": f"The Instagram session file is readable by other users: {session_file}",
+            "saved_session_has_no_account": f"The Instagram session at {session_file} has no signed-in account.",
+            "saved_session_account_mismatch": f"The saved Instagram session is not signed in as {account}.",
+        }
+        hint = f"chmod 600 '{session_file}'" if code == "saved_session_not_private" else None
+        error = InstagramSessionError(session_code, message=details[code], hint=hint, account=account).to_error()
+        error["code"] = code
+        return error
+    hint = IMPORT_HINTS.get(code, RETRY_HINT).format(account=account)
+    return error_object(code, f"The import stopped: {code.replace('_', ' ')}.", hint)
+
+
+def _parser():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Example: ghost-in-the-box instagram-import import --account YOUR_HANDLE --pages 1")
+    parser.add_argument("command", choices=tuple(HELP), metavar="COMMAND",
+                        help="; ".join(f"{name}: {text}" for name, text in HELP.items()))
+    parser.add_argument("--account", dest="account", metavar="HANDLE", help="your Instagram handle (required)")
+    # The old spelling keeps working without being advertised.
+    parser.add_argument("--username", dest="account", help=argparse.SUPPRESS)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_ROOT, metavar="DIR",
+                        help="state directory holding ig/HANDLE.json (default: see ghost-in-the-box config)")
+    parser.add_argument("--pages", type=_bounded(1, 5), default=1, metavar="N", help="pages to fetch, 1..5 (default 1)")
+    parser.add_argument("--page-size", type=_bounded(1, 33), default=12, metavar="N",
+                        help="posts per page, 1..33 (default 12)")
     parser.add_argument("--older", action="store_true", help="continue saved historical pagination")
-    parser.add_argument("--deadline", type=int, choices=range(30, 601), default=120)
-    parser.add_argument("--limit", type=int, choices=range(1, 21), default=5)
-    parser.add_argument("--media-pk")
-    args = parser.parse_args()
-    if not re.fullmatch(r"[A-Za-z0-9_.]{1,30}", args.username):
-        parser.error("invalid username")
+    parser.add_argument("--deadline", type=_bounded(30, 600), default=120, metavar="SECONDS",
+                        help="stop an import after this long, 30..600 (default 120)")
+    parser.add_argument("--limit", type=_bounded(1, 20), default=5, metavar="N", help="posts for list, 1..20 (default 5)")
+    parser.add_argument("--media-pk", metavar="MEDIA_PK", help="numeric post ID for show")
+    return parser
+
+
+@guarded("instagram-import")
+def main(argv=None):
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if not args.account:
+        parser.error("--account HANDLE is required, e.g. instagram-import status --account YOUR_HANDLE")
+    account = check_account(parser, args.account)
     os.umask(0o077)
-    directory = args.state_root.expanduser() / "ig-corpus" / args.username
+    directory = args.state_root.expanduser() / "ig-corpus" / account
+    session_file = args.state_root.expanduser() / "ig" / (account + ".json")
     client = None
     locked = False
     try:
@@ -262,10 +334,16 @@ def main():
                     raise DeadlineExceeded()
                 signal.signal(signal.SIGALRM, expired)
                 signal.alarm(args.deadline)
-                client, audit = make_client(args.state_root.expanduser() / "ig" / (args.username + ".json"))
-                result = import_posts(client, directory, args.username, pages=args.pages,
+                client, audit = make_client(session_file)
+                result = import_posts(client, directory, account, pages=args.pages,
                                       page_size=args.page_size, older=args.older, transport=audit)
                 signal.alarm(0)
+            if not result.get("ok", True):
+                code = result.get("error") or ("deadline_exceeded" if result.get("error_type") == "DeadlineExceeded"
+                                               else "import_failed")
+                result["error"] = _import_error(code, account, session_file)
+                emit(result)
+                return EXIT_RUNTIME
         elif args.command == "status":
             result = corpus_status(directory)
         elif args.command == "show":
@@ -280,25 +358,42 @@ def main():
             result = {"posts": [{k: row[k] for k in ("media_pk", "source_uri", "source_anchor", "source_author", "source_date")} |
                       {"caption": row["caption"][:400], "caption_truncated": len(row["caption"]) > 400}
                       for row in records[:args.limit]]}
-        print(json.dumps(result, ensure_ascii=False))
-        return 0 if result.get("ok", True) else 1
+        emit(result)
+        return EXIT_OK
     except (Exception, DeadlineExceeded) as error:
-        result = {"ok": False, "error_type": type(error).__name__}
         if isinstance(error, ImportFailure):
-            result["error"] = str(error)
+            code = str(error)
+            exit_code = EXIT_AUTH if code in SESSION_FAILURES else (
+                EXIT_USAGE if code in IMPORT_HINTS else EXIT_RUNTIME)
+            result = {"ok": False, "error_type": type(error).__name__,
+                      "error": _import_error(code, account, session_file)}
+        elif isinstance(error, DeadlineExceeded):
+            exit_code = EXIT_RUNTIME
+            result = {"ok": False, "error_type": "DeadlineExceeded",
+                      "error": _import_error("deadline_exceeded", account, session_file)}
+        elif isinstance(error, BlockingIOError):
+            exit_code = EXIT_RUNTIME
+            result = failure("import_running", f"Another import for {account} is running.",
+                             f"wait for it, then check: ghost-in-the-box instagram-import status --account {account}",
+                             error_type=type(error).__name__)
+        elif isinstance(error, ModuleNotFoundError):
+            exit_code = EXIT_AUTH
+            result = failure("dependency_unavailable", "The Instagram client library is not installed.",
+                             install_command("instagram"), error_type=type(error).__name__)
+        else:
+            exit_code, result = exception_failure(error, command=COMMAND, reveal=False)
         if args.command == "import" and locked:
             try:
-                atomic_json(directory / "status.json", result | {"finished_at": now(), "username": args.username})
+                atomic_json(directory / "status.json", result | {"finished_at": now(), "username": account})
             except OSError:
                 result["receipt_written"] = False
-        print(json.dumps(result))
-        return 1
+        emit(result)
+        return exit_code
     finally:
         signal.alarm(0)
         if client is not None:
             client.private.close()
             client.public.close()
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

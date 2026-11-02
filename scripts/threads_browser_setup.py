@@ -19,6 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from farm.config import STATE_ROOT
 from farm.accounts import AccountRegistry
+from farm.cli_output import EXIT_AUTH, EXIT_RUNTIME, EXIT_USAGE, attach_error, guarded
+from farm.threads_transport import NODE_INSTALL
 
 
 BASE = STATE_ROOT / 'threads-browser-fallback'
@@ -148,26 +150,59 @@ def _seed(account: str, node: Path, source: Path) -> bool:
     return True
 
 
+ERRORS = {
+    "invalid_account": (EXIT_USAGE, "Use a Threads handle with letters, digits, '.' or '_'.",
+                        "ghost-in-the-box threads-setup --account YOUR_HANDLE"),
+    "node_and_npm_required": (EXIT_AUTH, "SOCIAL_FARM_NODE or the node on PATH has no npm next "
+                              "to it.", "Install Node.js 24 with npm, or point SOCIAL_FARM_NODE "
+                              "at a node binary that has npm beside it."),
+    "install_node_and_npm_for_this_platform": (EXIT_AUTH, "Automatic Node.js setup only covers "
+                                               "Linux x86-64.", NODE_INSTALL),
+    "git_required": (EXIT_AUTH, "git is needed to fetch the pinned threads-mcp source.",
+                     "Install git, then re-run this command."),
+    "node_checksum_mismatch": (EXIT_RUNTIME, "The downloaded Node.js archive failed its "
+                               "checksum, so it was discarded.", "Retry; if it repeats, check "
+                               "your network or proxy."),
+    "source_revision_mismatch": (EXIT_RUNTIME, "The local threads-mcp checkout is not at the "
+                                 "pinned revision.", "Remove {source} and re-run this command."),
+    "setup_failed": (EXIT_RUNTIME, "A setup step failed.", "Re-run this command; the steps "
+                     "resume where they stopped."),
+}
+SETUP_CODES = {"node_and_npm_required", "install_node_and_npm_for_this_platform",
+               "node_checksum_mismatch", "source_revision_mismatch"}
+
+
+@guarded("threads-setup")
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--account", required=True)
+    parser.add_argument("--account", required=True, metavar="HANDLE", help="your Threads handle")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9._]+", args.account):
-        print(json.dumps({"ok": False, "status": "invalid_account"}))
-        return 2
+        result = {"ok": False, "status": "invalid_account"}
+        code = attach_error(result, ERRORS, account=args.account)
+        print(json.dumps(result))
+        return code
     os.umask(0o077)
-    BASE.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(BASE, 0o700)
     try:
+        BASE.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(BASE, 0o700)
         node = _node()
         source = _source(node)
         _binary(node, source)
         seeded = _seed(args.account, node, source)
         print(json.dumps({"ok": True, "status": "ready", "profile_seeded": seeded}))
         return 0
+    except RuntimeError as exc:
+        result = {"ok": False, "status": str(exc) if str(exc) in SETUP_CODES else "setup_failed"}
+    except FileNotFoundError as exc:
+        # git and npm are run by name; a missing executable is a dependency, not a failure.
+        result = {"ok": False, "status": "git_required" if "git" in str(exc.filename or "")
+                  else "setup_failed"}
     except Exception:
-        print(json.dumps({"ok": False, "status": "setup_failed"}))
-        return 1
+        result = {"ok": False, "status": "setup_failed"}
+    code = attach_error(result, ERRORS, account=args.account, source=str(BASE / "source"))
+    print(json.dumps(result))
+    return code
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 """Production Scrapling transport selected after a verified browser login."""
 from __future__ import annotations
 
-from farm.config import STATE_ROOT
+from farm.accounts import account_key_matches
+from farm.config import threads_scrapling_dir
+from farm.session_files import is_private
 
 
 
@@ -16,8 +18,9 @@ import time
 
 from farm.adapters.threads import AuthUnavailable, PreSendFailure, PublishUncertain, ThreadsReadFailure
 from farm.outbox import frozen_payload_matches
+from farm.threads_transport import ThreadsDependencyUnavailable, scrapling_install
 
-BASE = STATE_ROOT / 'threads-scrapling'
+BASE = threads_scrapling_dir()
 PYTHON = Path(os.environ.get("SOCIAL_FARM_SCRAPLING_PYTHON") or sys.executable)
 BRIDGE = Path(__file__).resolve().parents[1] / "scripts/threads_scrapling_bridge.py"
 
@@ -32,7 +35,7 @@ def verified_profile(account: str, state_dir: Path = BASE) -> bool:
     path = Path(state_dir) / account / "verified-cookies.json"
     profile = path.parent / "profile"
     try:
-        if (path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077 or
+        if (path.is_symlink() or not path.is_file() or not is_private(path) or
                 profile.is_symlink() or not profile.is_dir()):
             return False
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -50,8 +53,11 @@ class ScraplingThreadsAdapter:
         self.max_busy_retries = max_busy_retries
 
     def _call(self, account: str, payload: dict) -> dict:
-        if not verified_profile(account, self.state_dir) or not self.python.is_file():
+        if not verified_profile(account, self.state_dir):
             raise AuthUnavailable("browser_login_required")
+        if not self.python.is_file():
+            raise ThreadsDependencyUnavailable(
+                "python", "set SOCIAL_FARM_SCRAPLING_PYTHON to a Python with the browser extra")
         env = os.environ.copy()
         env["SOCIAL_FARM_THREADS_SCRAPLING_STATE"] = str(self.state_dir)
         try:
@@ -63,23 +69,35 @@ class ScraplingThreadsAdapter:
             data = json.loads(response.stdout.strip().splitlines()[-1])
             if not isinstance(data, dict):
                 raise ValueError("invalid bridge result")
-            return data
         except (ValueError, IndexError, AttributeError) as exc:
             raise PublishUncertain("Scrapling browser outcome unknown") from exc
+        if data.get("status") == "dependency_unavailable":
+            # The bridge reports this before opening a browser, so nothing was sent.
+            raise ThreadsDependencyUnavailable(
+                "scrapling", scrapling_install(self.python))
+        return data
 
     def publish(self, job: dict, *, verify_only=False) -> dict:
         if job.get("platform") != "threads" or not frozen_payload_matches(job):
             raise PreSendFailure("Threads job changed before send")
         if job.get("media_path") or job.get("action") not in {"post", "reply"}:
             raise PreSendFailure("Scrapling publisher supports text posts and replies")
+        self._registration(job)
+        return self._publish(job, verify_only=verify_only)
+
+    def _registration(self, job):
         account = job["account"]
         registration = self.registry.status("threads", account)
         linked = self.registry.status("instagram", account)
-        if (not registration or not linked or registration["account_key"] != job.get("account_key") or
+        if (not registration or not linked or
+                not account_key_matches(registration, job.get("account_key")) or
                 registration["account_key"] != linked["account_key"] or
                 registration["kind"] != "instagrapi_settings" or linked["kind"] != "instagrapi_settings" or
                 registration["session_file"] != linked["session_file"]):
             raise PreSendFailure("Threads job account registration mismatch")
+
+    def _publish(self, job, *, verify_only=False):
+        account = job["account"]
         data = self._call(account, {"mode": "verify" if verify_only else "publish", "job": job})
         status = data.get("status")
         if verify_only and status == "verified" and data.get("account") == account:
@@ -138,6 +156,8 @@ class ScraplingThreadsAdapter:
         for attempt in range(self.max_busy_retries + 1):
             try:
                 data = self._call(account, payload)
+            except ThreadsDependencyUnavailable:
+                raise
             except (AuthUnavailable, PublishUncertain) as exc:
                 raise ThreadsReadFailure("Scrapling browser read unavailable") from exc
             if data.get("status") != "profile_busy":

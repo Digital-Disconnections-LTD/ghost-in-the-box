@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Collect, search, categorize, and prepare the private technology meme library.
 
-python3 scripts/meme_library.py collect --count 250
-python3 scripts/meme_library.py search --category ai --limit 12
-python3 scripts/meme_library.py prepare-carousel ID1 ID2 --out /tmp/meme-carousel
+  ghost-in-the-box memes collect --count 250
+  ghost-in-the-box memes search debugging --category ai --limit 12
+  ghost-in-the-box memes prepare-carousel ID1 ID2 --out ./meme-carousel
+  ghost-in-the-box memes import-local image.jpg --source-url URL
+
+Exit codes: 0 ok, 1 runtime failure, 2 usage, 4 missing media extra.
 """
 from __future__ import annotations
 
@@ -11,9 +14,9 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import fcntl
 import hashlib
 import html
+import importlib.util
 import io
 import json
 import os
@@ -26,8 +29,12 @@ import tempfile
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-ROOT = Path.home() / ".batbox/media-reference/tech-memes"
-RUNTIME = Path(sys.executable)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from farm import locking as fcntl
+from farm.cli_output import EXIT_AUTH, emit, fail, guarded
+from farm.config import install_command, memes_root
+
+ROOT = memes_root()
 USER_AGENT = "Batbox meme library/2.0 (+https://digitaldisconnections.com/)"
 MAX_BYTES = 12_000_000
 SOURCE_FIELDS = (
@@ -636,71 +643,84 @@ def prepare_carousel(root: Path, items: list[str], destination: Path, background
             shutil.rmtree(staging)
 
 
-def ensure_runtime() -> None:
-    try:
-        import PIL  # noqa: F401
-        import requests  # noqa: F401
-    except ImportError:
-        if RUNTIME.is_file() and os.path.abspath(sys.executable) != str(RUNTIME):
-            os.execv(str(RUNTIME), [str(RUNTIME), str(Path(__file__).resolve()), *sys.argv[1:]])
-        raise SystemExit("Install media dependencies with pip install -e .[media]")
+COMMAND = "memes"
 
 
-def main() -> int:
+def missing_media_modules() -> list[str]:
+    return [name for name in ("PIL", "requests") if importlib.util.find_spec(name) is None]
+
+
+@guarded(COMMAND)
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--root", type=Path, default=ROOT)
-    commands = parser.add_subparsers(dest="command", required=True)
-    gathering = commands.add_parser("collect", help="append new memes, OCR, and refresh topic folders")
-    gathering.add_argument("--count", type=int, default=250, help="maximum NEW unique images, never a total cap")
-    gathering.add_argument("--pages", type=int, default=3, help="pages of 50 per source/sort/search")
-    gathering.add_argument("--min-score", type=int, default=25)
-    gathering.add_argument("--query", action="append", help="targeted search instead of default source feeds; repeatable")
-    organizing = commands.add_parser("organize", help="refresh topic symlinks, OCR, and indexes offline")
-    organizing.add_argument("--redo-ocr", action="store_true")
-    looking = commands.add_parser("search", help="find cached images and return paths and provenance")
-    looking.add_argument("query", nargs="?", default="")
-    looking.add_argument("--category", choices=PRIMARY_ORDER)
-    looking.add_argument("--limit", type=int, default=12)
-    looking.add_argument("--min-score", type=int, default=0)
-    preparation = commands.add_parser("prepare-carousel", help="pad 2..10 selections into ordered 1080x1350 JPEGs")
-    preparation.add_argument("items", nargs="+", help="short image IDs or cached image paths")
-    preparation.add_argument("--out", type=Path, required=True)
-    preparation.add_argument("--background", default="#111111")
-    importing = commands.add_parser("import-local", help="import a downloaded image with source metadata")
-    importing.add_argument("image", type=Path)
-    importing.add_argument("--metadata", type=Path, help="JSON object with source_url, author, caption, likes, etc.")
-    importing.add_argument("--source-url")
-    importing.add_argument("--title")
-    importing.add_argument("--caption")
-    importing.add_argument("--author")
-    args = parser.parse_args()
+    parser.add_argument("--root", type=Path, default=ROOT, metavar="DIR",
+                        help="library directory (default: see ghost-in-the-box config)")
+    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    gathering = commands.add_parser("collect", help="append new memes, OCR, and refresh topic folders",
+                                    description="Download new memes from the default sources (or --query), "
+                                                "OCR them and refresh the topic folders.")
+    gathering.add_argument("--count", type=int, default=250, metavar="N",
+                           help="maximum NEW unique images, 1..5000, never a total cap (default 250)")
+    gathering.add_argument("--pages", type=int, default=3, metavar="N",
+                           help="pages of 50 per source/sort/search, 1..20 (default 3)")
+    gathering.add_argument("--min-score", type=int, default=25, metavar="N", help="minimum engagement (default 25)")
+    gathering.add_argument("--query", action="append", metavar="WORDS",
+                           help="targeted search instead of default source feeds; repeatable")
+    organizing = commands.add_parser("organize", help="refresh topic symlinks, OCR, and indexes offline",
+                                     description="Refresh topic symlinks, OCR and indexes without the network.")
+    organizing.add_argument("--redo-ocr", action="store_true", help="OCR every image again")
+    looking = commands.add_parser("search", help="find cached images and return paths and provenance",
+                                  description="Find cached images; returns local paths and where each came from.")
+    looking.add_argument("query", nargs="?", default="", metavar="WORDS", help="words to find in titles and OCR text")
+    looking.add_argument("--category", choices=PRIMARY_ORDER, metavar="CATEGORY",
+                         help="one of: " + ", ".join(PRIMARY_ORDER))
+    looking.add_argument("--limit", type=int, default=12, metavar="N", help="maximum results (default 12)")
+    looking.add_argument("--min-score", type=int, default=0, metavar="N", help="minimum engagement (default 0)")
+    preparation = commands.add_parser("prepare-carousel", help="pad 2..10 selections into ordered 1080x1350 JPEGs",
+                                      description="Pad 2-10 cached images into ordered 1080x1350 JPEG slides "
+                                                  "for: ghost-in-the-box carousel draft")
+    preparation.add_argument("items", nargs="+", metavar="ID", help="short image IDs or cached image paths")
+    preparation.add_argument("--out", type=Path, required=True, metavar="DIR", help="new or empty output directory")
+    preparation.add_argument("--background", default="#111111", metavar="COLOUR", help="padding colour (default #111111)")
+    importing = commands.add_parser("import-local", help="import a downloaded image with source metadata",
+                                    description="Add one local image to the library with where it came from.")
+    importing.add_argument("image", type=Path, metavar="IMAGE", help="JPEG, PNG or WebP file")
+    importing.add_argument("--metadata", type=Path, metavar="PATH",
+                           help="JSON object with source_url, author, caption, likes, etc.")
+    importing.add_argument("--source-url", metavar="URL", help="where the image was published")
+    importing.add_argument("--title", metavar="TEXT")
+    importing.add_argument("--caption", metavar="TEXT")
+    importing.add_argument("--author", metavar="NAME")
+    args = parser.parse_args(argv)
     root = args.root.expanduser().resolve()
-    if args.command != "search":
-        ensure_runtime()
-    try:
-        if args.command == "collect":
-            if not 1 <= args.count <= 5000 or not 1 <= args.pages <= 20 or args.min_score < 0:
-                parser.error("count must be 1..5000, pages 1..20, and minimum score nonnegative")
-            result = collect(root, args.count, args.pages, args.min_score, args.query)
-        elif args.command == "organize":
-            result = organize(root, redo_ocr=args.redo_ocr)
-        elif args.command == "search":
-            if args.limit < 1:
-                parser.error("limit must be positive")
-            result = search(root, args.query, args.category, args.limit, args.min_score)
-        elif args.command == "prepare-carousel":
-            result = prepare_carousel(root, args.items, args.out, args.background)
-        else:
-            metadata = json.loads(args.metadata.read_text(encoding="utf-8")) if args.metadata else {}
-            for key in ("source_url", "title", "caption", "author"):
-                if getattr(args, key):
-                    metadata[key] = getattr(args, key)
-            result = import_local(root, args.image, metadata)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
-    except (ValueError, OSError) as error:
-        parser.error(str(error))
-
+    if args.command == "collect" and (not 1 <= args.count <= 5000 or not 1 <= args.pages <= 20
+                                      or args.min_score < 0):
+        parser.error("--count must be 1..5000, --pages 1..20, and --min-score nonnegative")
+    if args.command == "search" and args.limit < 1:
+        parser.error("--limit must be positive")
+    missing = missing_media_modules() if args.command != "search" else []
+    if missing:
+        return fail("dependency_unavailable",
+                    f"memes {args.command} needs {', '.join(missing)} (the 'media' extra).",
+                    install_command("media"), EXIT_AUTH)
+    if args.command == "collect":
+        result = collect(root, args.count, args.pages, args.min_score, args.query)
+    elif args.command == "organize":
+        result = organize(root, redo_ocr=args.redo_ocr)
+    elif args.command == "search":
+        result = search(root, args.query, args.category, args.limit, args.min_score)
+    elif args.command == "prepare-carousel":
+        result = prepare_carousel(root, args.items, args.out, args.background)
+    else:
+        metadata = json.loads(args.metadata.read_text(encoding="utf-8")) if args.metadata else {}
+        if not isinstance(metadata, dict):
+            raise ValueError("--metadata must be a JSON object")
+        for key in ("source_url", "title", "caption", "author"):
+            if getattr(args, key):
+                metadata[key] = getattr(args, key)
+        result = import_local(root, args.image, metadata)
+    emit(result, indent=2)
+    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())

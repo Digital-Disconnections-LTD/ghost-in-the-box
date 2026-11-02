@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -14,11 +13,14 @@ import sys
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from farm import locking as fcntl
 
+from farm.cli_output import add_body_arguments, check_account, guarded, read_body
 from farm.config import STATE_ROOT
 from farm.outbox import Outbox, file_sha256
 
 ROOT = STATE_ROOT / 'carousels'
+COMMAND = "carousel"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 
@@ -102,31 +104,42 @@ def _snapshot_draft(*, account, body, sources, crosspost_threads, source_urls,
         raise
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest="command", required=True)
-    draft = commands.add_parser("draft")
-    draft.add_argument("--account", default="example_creator")
-    draft.add_argument("--body-file", required=True)
-    draft.add_argument("--image", action="append", required=True)
-    draft.add_argument("--crosspost-threads", action="store_true")
-    draft.add_argument("--source-url", action="append", default=[])
-    draft.add_argument("--idempotency-key")
-    args = parser.parse_args(argv)
-    os.umask(0o077)
-    try:
-        job = create_draft(account=args.account,
-            body=Path(args.body_file).read_text(encoding="utf-8"),
-            images=[Path(value) for value in args.image],
-            crosspost_threads=args.crosspost_threads,
-            source_urls=args.source_url, idempotency_key=args.idempotency_key)
-        print(json.dumps({"ok": True, "job_id": job["id"],
-                          "status": job["status"], "slides": len(args.image)}))
-        return 0
-    except Exception as exc:
-        print(json.dumps({"ok": False, "error_type": type(exc).__name__}))
-        return 2
+CAPTION_LIMIT = 2200
 
+
+@guarded(COMMAND)
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Example: ghost-in-the-box carousel draft --account YOUR_HANDLE --body-file caption.txt "
+               "--image slide1.jpg --image slide2.jpg")
+    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    draft = commands.add_parser("draft", help="snapshot 2-10 images and a caption into one outbox draft",
+                                description="Snapshot 2-10 images and a caption into one Instagram "
+                                            "outbox draft. Sends nothing.")
+    draft.add_argument("--account", required=True, metavar="HANDLE", help="your Instagram handle")
+    add_body_arguments(draft, noun="caption")
+    draft.add_argument("--image", action="append", required=True, metavar="PATH",
+                       help="JPG, PNG or WebP slide; repeat 2-10 times in order")
+    draft.add_argument("--crosspost-threads", action="store_true",
+                       help="also ask Instagram to share the post to the linked Threads account")
+    draft.add_argument("--source-url", action="append", default=[], metavar="URL",
+                       help="source kept with the draft; repeatable")
+    draft.add_argument("--idempotency-key", metavar="KEY",
+                       help="stable key; repeating it returns the same draft instead of a duplicate")
+    args = parser.parse_args(argv)
+    account = check_account(parser, args.account)
+    if not 2 <= len(args.image) <= 10:
+        parser.error("give --image 2 to 10 times")
+    os.umask(0o077)
+    job = create_draft(account=account,
+        body=read_body(args.body, args.body_file, limit=CAPTION_LIMIT, allow_blank=True),
+        images=[Path(value) for value in args.image],
+        crosspost_threads=args.crosspost_threads,
+        source_urls=args.source_url, idempotency_key=args.idempotency_key)
+    print(json.dumps({"ok": True, "job_id": job["id"], "status": job["status"], "slides": len(args.image),
+                      "next": f"ghost-in-the-box outbox queue {job['id']}"}))
+    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
