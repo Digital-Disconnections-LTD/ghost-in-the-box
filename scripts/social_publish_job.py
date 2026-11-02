@@ -20,8 +20,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from farm.accounts import AccountRegistry, account_key_matches
 from farm.adapters import (
-    AuthUnavailable, DependencyUnavailable, PreSendFailure, PublishRejected, PublishUncertain,
-    safe_reason,
+    EXCERPT_LIMIT, REASON_LIMIT, AuthUnavailable, DependencyUnavailable, PreSendFailure,
+    PublishRejected, PublishUncertain, safe_reason,
 )
 from farm.adapters.instagram import InstagramAdapter
 from farm.adapters.threads import ThreadsAdapter
@@ -189,8 +189,10 @@ def publish_claimed(box, job: dict, *, instagram_factory=InstagramAdapter,
                     platform, LEGACY_DEPENDENCY_MESSAGES[str(exc)], base))
             return release(EXIT_AUTH, _auth_result(exc, job, base))
         # Adapter text reaches stdout, MCP clients and last_error, so only a
-        # sanitised short reason leaves this function.
-        reason = safe_reason(exc)
+        # sanitised short reason leaves this function. An excerpt was already
+        # reduced by safe_excerpt, so it may make the reason longer.
+        excerpt = getattr(exc, "excerpt", None)
+        reason = safe_reason(exc, limit=REASON_LIMIT + EXCERPT_LIMIT + 2) if excerpt else safe_reason(exc)
         if isinstance(exc, PublishRejected):
             return finish(EXIT_RUNTIME, failure(
                 "rejected", "provider_rejected", reason,
@@ -207,7 +209,8 @@ def publish_claimed(box, job: dict, *, instagram_factory=InstagramAdapter,
             return finish(EXIT_UNCERTAIN, failure(
                 "uncertain", "publish_uncertain",
                 "The provider may have received this post; it will not be resent automatically.",
-                uncertain_hint, **base), outcome="uncertain", error="provider call uncertain")
+                uncertain_hint, **base), outcome="uncertain",
+                error=f"provider call uncertain: {reason}" if excerpt else "provider call uncertain")
         if window["open"]:
             # The send window was open, so the public request may have begun.
             # Never make this job eligible for automatic resend.

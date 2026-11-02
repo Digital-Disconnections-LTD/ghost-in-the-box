@@ -202,6 +202,9 @@ ENVIRONMENT = (
     ("SOCIAL_FARM_THREADS_NOTIFY_AGENT", "Durable worker recipient for Threads notifications", "none",
      "threads-notifications"),
     ("SOCIAL_FARM_ACCOUNT", "Account used by the Threads publish systemd unit", "none", "systemd units"),
+    ("SOCIAL_FARM_LINKEDIN_SHARE_QUERY_ID",
+     "GraphQL query id of LinkedIn's web share call (set it when LinkedIn rotates the id)",
+     "voyagerContentcreationDashShares.279996efa5064c01775d5aff003d9377", "publish"),
 )
 KNOWN_ENVIRONMENT = frozenset(name for name, *_ in ENVIRONMENT)
 

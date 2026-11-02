@@ -6,16 +6,19 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+import os
 from unittest.mock import Mock, patch
 
 import requests
+from requests.structures import CaseInsensitiveDict
 from urllib3.exceptions import NewConnectionError
 
 import farm.adapters as shared
+from farm import config
 from farm.accounts import AccountRegistry
-from farm.adapters.linkedin import (AuthUnavailable, LinkedInAdapter, LinkedInReadFailure,
-                                    PreSendFailure, PublishRejected, PublishUncertain, identity,
-                                    little_text)
+from farm.adapters.linkedin import (SHARE_QUERY_ENV, SHARE_QUERY_ID, AuthUnavailable, LinkedInAdapter,
+                                    LinkedInReadFailure, PreSendFailure, PublishRejected,
+                                    PublishUncertain, identity, little_text)
 from farm.login import save_login
 from farm.outbox import Outbox
 from farm.session_files import read_session
@@ -23,11 +26,21 @@ from scripts.social_publish_job import run
 from test_login import session
 
 
-def response(data=None, status=200, headers=None):
-    return SimpleNamespace(status_code=status, json=lambda: data or {}, headers=headers or {})
+def response(data=None, status=200, headers=None, text=None):
+    return SimpleNamespace(status_code=status, json=lambda: data or {}, headers=headers or {},
+                           text=json.dumps(data or {}) if text is None else text)
+
+
+def unreadable(status=200, text="<html>gateway</html>"):
+    def fail():
+        raise ValueError("not JSON")
+    return SimpleNamespace(status_code=status, json=fail, headers={}, text=text)
 
 
 ME = {"miniProfile": {"publicIdentifier": "mine", "entityUrn": "urn:li:fs_miniProfile:ABC123"}}
+SHARED = {"data": {"data": {"createContentcreationDashShares": {
+    "resourceKey": "urn:li:fsd_share:urn:li:share:123", "*entity": "urn:li:fsd_share:urn:li:share:123"}}},
+    "included": []}
 
 
 class LinkedInTests(unittest.TestCase):
@@ -39,7 +52,11 @@ class LinkedInTests(unittest.TestCase):
         self.entry = save_login("linkedin", "mine", session(), registry=self.registry, state_root=self.root)
         self.http = Mock(cookies=requests.cookies.RequestsCookieJar())
         self.http.get.return_value = response(ME)
-        self.http.post.return_value = response(status=201, headers={"x-restli-id": "urn:li:share:123"})
+        self.http.post.return_value = response(SHARED)
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(SHARE_QUERY_ENV, None)
         self.adapter = LinkedInAdapter(self.registry, self.http)
         self.job = {"platform": "linkedin", "account": "mine", "account_key": "linkedin:mine", "action": "post",
                     "body": "Exact #text [test]", "body_sha256": hashlib.sha256(b"Exact #text [test]").hexdigest(),
@@ -72,11 +89,153 @@ class LinkedInTests(unittest.TestCase):
         boundary = Mock()
         result = self.adapter.publish(self.job, before_send=boundary)
         self.assertEqual(result["provider_id"], "urn:li:share:123")
+        self.assertEqual(result["permalink"], "https://www.linkedin.com/feed/update/urn:li:share:123/")
         self.assertEqual(self.http.post.call_count, 1)
         boundary.assert_called_once()
-        payload = self.http.post.call_args.kwargs["json"]
-        self.assertEqual(payload["author"], "urn:li:person:ABC123")
-        self.assertEqual(payload["commentary"], "Exact #text \\[test\\]")
+        call = self.http.post.call_args
+        self.assertEqual(call.args[0], "https://www.linkedin.com/voyager/api/graphql")
+        self.assertEqual(call.kwargs["params"], {"action": "execute", "queryId": SHARE_QUERY_ID})
+        self.assertFalse(call.kwargs["allow_redirects"])
+        payload = call.kwargs["json"]
+        self.assertEqual(payload["queryId"], SHARE_QUERY_ID)
+        self.assertTrue(payload["includeWebMetadata"])
+        self.assertEqual(payload["variables"]["post"], {
+            "allowedCommentersScope": "ALL", "intendedShareLifeCycleState": "PUBLISHED", "origin": "FEED",
+            "visibilityDataUnion": {"visibilityType": "ANYONE"},
+            "commentary": {"text": "Exact #text [test]", "attributesV2": []}})
+
+    def test_share_headers_carry_csrf_from_jsessionid_and_graphql_client(self):
+        self.adapter.publish(self.job)
+        headers = CaseInsensitiveDict(self.http.post.call_args.kwargs["headers"])
+        self.assertEqual(headers["csrf-token"], "ajax:123")
+        self.assertEqual(headers["x-li-graphql-pegasus-client"], "true")
+        self.assertEqual(headers["x-restli-protocol-version"], "2.0.0")
+        self.assertEqual(headers["x-li-lang"], "en_US")
+        self.assertEqual(headers["content-type"], "application/json; charset=UTF-8")
+        self.assertEqual(headers["accept"], "application/vnd.linkedin.normalized+json+2.1")
+        self.assertEqual(headers["x-li-pem-metadata"], "Voyager - Sharing - CreateShare=sharing-create-content")
+        self.assertEqual(headers["origin"], "https://www.linkedin.com")
+        self.assertEqual(headers["referer"], "https://www.linkedin.com/feed/")
+        self.assertEqual(headers["user-agent"], "TEST_UA")
+
+    def test_before_send_runs_once_after_identity_and_right_before_the_post(self):
+        order = Mock()
+        self.http.get.side_effect = lambda *a, **k: (order.identity(), response(ME))[1]
+        self.http.post.side_effect = lambda *a, **k: (order.post(), response(SHARED))[1]
+        self.adapter.publish(self.job, before_send=order.before_send)
+        self.assertEqual([c[0] for c in order.mock_calls], ["identity", "before_send", "post"])
+
+    def test_query_id_environment_override_is_used(self):
+        digest = "0123456789abcdef0123456789abcdef"
+        for value in (digest, "voyagerContentcreationDashShares." + digest):
+            with self.subTest(value=value):
+                os.environ[SHARE_QUERY_ENV] = value
+                self.adapter.publish(self.job)
+                call = self.http.post.call_args
+                self.assertEqual(call.kwargs["params"]["queryId"], "voyagerContentcreationDashShares." + digest)
+                self.assertEqual(call.kwargs["json"]["queryId"], "voyagerContentcreationDashShares." + digest)
+
+    def test_malformed_query_id_override_fails_before_any_request(self):
+        boundary = Mock()
+        for value in ("voyagerSomethingElse.0123456789abcdef0123456789abcdef", "abc", "x" * 40):
+            with self.subTest(value=value):
+                os.environ[SHARE_QUERY_ENV] = value
+                with self.assertRaisesRegex(PreSendFailure, SHARE_QUERY_ENV) as caught:
+                    self.adapter.publish(self.job, before_send=boundary)
+                self.assertNotIsInstance(caught.exception, PublishRejected)
+        self.http.post.assert_not_called()
+        self.http.get.assert_not_called()
+        boundary.assert_not_called()
+
+    def test_default_query_id_is_the_documented_setting(self):
+        row = next(r for r in config.ENVIRONMENT if r[0] == SHARE_QUERY_ENV)
+        self.assertEqual(row[2], SHARE_QUERY_ID)
+        self.assertIn(SHARE_QUERY_ENV, config.KNOWN_ENVIRONMENT)
+
+    def test_ok_answer_with_graphql_errors_is_rejected_with_the_message(self):
+        self.http.post.return_value = response({"data": {"data": {"createContentcreationDashShares": None},
+                                                         "errors": [{"message": "Invalid share"}]}})
+        with self.assertRaisesRegex(PublishRejected, "Invalid share") as caught:
+            self.adapter.publish(self.job)
+        self.assertEqual(caught.exception.status_code, 200)
+        self.assertEqual(self.http.post.call_count, 1)
+        self.http.post.return_value = response({"errors": [{"message": "You can't post right now"}]})
+        with self.assertRaisesRegex(PublishRejected, "You can't post right now"):
+            self.adapter.publish(self.job)
+
+    def test_ok_answer_without_share_urn_or_errors_is_uncertain(self):
+        for data in ({"data": {"data": {"createContentcreationDashShares": {}}}},
+                     {"data": {"data": {"createContentcreationDashShares": {"resourceKey": "urn:li:share:abc"}}}},
+                     {"data": {"data": None}}):
+            with self.subTest(data=data):
+                self.http.post.return_value = response(data)
+                with self.assertRaises(PublishUncertain):
+                    self.adapter.publish(self.job)
+        self.http.post.return_value = unreadable()
+        with self.assertRaisesRegex(PublishUncertain, "unreadable"):
+            self.adapter.publish(self.job)
+
+    def test_client_error_keeps_status_and_sanitised_body_excerpt(self):
+        body = json.dumps({"message": "Invalid share request", "status": 400, "serviceErrorCode": 65600,
+                           "echo": 'li_at=TEST_COOKIE; JSESSIONID="ajax:123"',
+                           "trace": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo0NTY3ODk="}) + "x" * 1000
+        self.http.post.return_value = response(status=400, text=body)
+        with self.assertRaises(PublishRejected) as caught:
+            self.adapter.publish(self.job)
+        message = str(caught.exception)
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("HTTP 400", message)
+        self.assertIn("Invalid share request", message)
+        self.assertIn("65600", message)
+        for secret in ("TEST_COOKIE", "ajax:123", "QUJDREVG", '"', "{", "="):
+            self.assertNotIn(secret, message)
+        self.assertLessEqual(len(caught.exception.excerpt), shared.EXCERPT_LIMIT)
+        self.assertEqual(shared.safe_reason(caught.exception, limit=shared.REASON_LIMIT + shared.EXCERPT_LIMIT + 2),
+                         message)
+
+    def test_refused_session_is_auth_unavailable_after_one_post(self):
+        for status, headers in ((401, {}), (403, {}),
+                                (302, {"Location": "https://www.linkedin.com/login?session_redirect=x"}),
+                                (303, {"Location": "https://www.linkedin.com/checkpoint/challenge/abc"})):
+            with self.subTest(status=status):
+                self.http.post.reset_mock()
+                self.http.post.return_value = response(status=status, headers=headers, text="TEST_COOKIE")
+                with self.assertRaises(AuthUnavailable) as caught:
+                    self.adapter.publish(self.job)
+                self.assertNotIn("TEST_COOKIE", str(caught.exception))
+                self.assertEqual(self.http.post.call_count, 1)
+
+    def test_other_redirect_is_uncertain(self):
+        self.http.post.return_value = response(status=302, headers={"Location": "https://www.linkedin.com/feed/"})
+        with self.assertRaises(PublishUncertain):
+            self.adapter.publish(self.job)
+
+    def test_router_stores_the_rejection_excerpt_in_last_error(self):
+        db = self.root / "outbox.sqlite3"
+        with patch("farm.outbox.AccountRegistry", return_value=self.registry), Outbox(db) as box:
+            draft = box.create_draft(platform="linkedin", account="mine", body="exact text")
+            job = box.queue(draft["id"])
+        self.http.post.return_value = response(status=400, text='{"message":"Invalid share","status":400}')
+        with redirect_stdout(io.StringIO()) as output:
+            code = run(job["id"], box_factory=lambda: Outbox(db), linkedin_factory=lambda: self.adapter)
+        self.assertEqual((code, json.loads(output.getvalue())["status"]), (1, "rejected"))
+        with Outbox(db) as box:
+            stored = box.get(job["id"])
+        self.assertEqual(stored["failure_kind"], "rejected")
+        self.assertEqual(stored["last_error"], "LinkedIn rejected the post with HTTP 400: message : Invalid share , status :400")
+
+    def test_router_keeps_the_excerpt_for_an_uncertain_server_error(self):
+        db = self.root / "outbox.sqlite3"
+        with patch("farm.outbox.AccountRegistry", return_value=self.registry), Outbox(db) as box:
+            draft = box.create_draft(platform="linkedin", account="mine", body="exact text")
+            job = box.queue(draft["id"])
+        self.http.post.return_value = response(status=502, text="<html>Bad gateway</html>")
+        with redirect_stdout(io.StringIO()):
+            code = run(job["id"], box_factory=lambda: Outbox(db), linkedin_factory=lambda: self.adapter)
+        self.assertEqual(code, 3)
+        with Outbox(db) as box:
+            self.assertEqual(box.get(job["id"])["last_error"],
+                             "provider call uncertain: LinkedIn answered the post with HTTP 502: html Bad gateway /html")
 
     def test_wrong_identity_and_changed_job_never_write(self):
         self.http.get.return_value = response({"miniProfile": {"publicIdentifier": "other", "entityUrn": "urn:li:fs_miniProfile:OTHER"}})
@@ -165,6 +324,18 @@ class LinkedInTests(unittest.TestCase):
         with self.assertRaisesRegex(PreSendFailure, "never left") as caught:
             self.adapter.publish(self.job)
         self.assertNotIsInstance(caught.exception, PublishRejected)
+
+    def test_safe_excerpt_drops_secrets_markup_and_length(self):
+        text = '{"error": "bad", "li_at": "S3CRET_VALUE", "token": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo0NTY3ODk="}\n'
+        excerpt = shared.safe_excerpt(text + "word " * 200, secrets=["S3CRET_VALUE"])
+        self.assertTrue(excerpt.startswith("error : bad , li_at :"))
+        self.assertIn("redacted", excerpt)
+        for leaked in ("S3CRET_VALUE", "QUJDREVG", '"', "{", "=", "\n"):
+            self.assertNotIn(leaked, excerpt)
+        self.assertLessEqual(len(excerpt), shared.EXCERPT_LIMIT)
+        self.assertEqual(shared.safe_excerpt(None), "")
+        self.assertEqual(str(PublishRejected("refused", excerpt="  ")), "refused")
+        self.assertIsNone(PublishUncertain("unknown").excerpt)
 
     def test_little_text_keeps_hashtags_and_escapes_url_fragments(self):
         self.assertEqual(little_text("#code https://example.com/#anchor #1"), "#code https://example.com/\\#anchor \\#1")

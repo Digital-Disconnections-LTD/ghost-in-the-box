@@ -1,8 +1,10 @@
 """Bounded LinkedIn Voyager calls using an owner-created browser session.
 
-These are unofficial LinkedIn web routes and may change. Writes remain
-experimental until the operator verifies them against their account; no
-automatic send retries.
+These are unofficial LinkedIn web routes and may change. Text posts use the
+share call of LinkedIn's current web client (Voyager GraphQL
+``voyagerContentcreationDashShares``). LinkedIn rotates that query id, so
+SOCIAL_FARM_LINKEDIN_SHARE_QUERY_ID can override it without a release. A send is
+never retried automatically.
 """
 from __future__ import annotations
 
@@ -19,13 +21,20 @@ from farm.accounts import AccountRegistry, account_key_matches
 from farm import locking
 from farm.adapters import (
     AuthUnavailable, DependencyUnavailable, PreSendFailure, PublishRejected, PublishUncertain,
-    ReadFailure, definite_rejection, request_never_sent,
+    ReadFailure, definite_rejection, request_never_sent, safe_excerpt,
 )
 from farm.outbox import frozen_payload_matches
 from farm.session_files import read_session, write_session
 
 BASE = "https://www.linkedin.com"
 API = BASE + "/voyager/api/"
+SHARE_QUERY_ENV = "SOCIAL_FARM_LINKEDIN_SHARE_QUERY_ID"
+SHARE_QUERY_ID = "voyagerContentcreationDashShares.279996efa5064c01775d5aff003d9377"
+SHARE_OPERATION = "voyagerContentcreationDashShares"
+SHARE_RESULT = "createContentcreationDashShares"
+_QUERY_HASH = re.compile(r"[0-9a-f]{32}")
+_SHARE_URN = re.compile(r"(?:urn:li:fsd_share:)?(urn:li:(?:share|ugcPost):\d+)")
+_LOGIN_PATHS = ("/login", "/uas/", "/checkpoint/", "/authwall", "/signup")
 
 
 class LinkedInReadFailure(ReadFailure):
@@ -35,7 +44,52 @@ class LinkedInReadFailure(ReadFailure):
 __all__ = [
     "AuthUnavailable", "DependencyUnavailable", "LinkedInAdapter", "LinkedInReadFailure",
     "PreSendFailure", "PublishRejected", "PublishUncertain", "identity", "little_text",
+    "share_query_id",
 ]
+
+
+def share_query_id() -> str:
+    """Return the GraphQL share query id, honouring the environment override."""
+    configured = (os.environ.get(SHARE_QUERY_ENV) or "").strip()
+    if not configured:
+        return SHARE_QUERY_ID
+    if _QUERY_HASH.fullmatch(configured):
+        return SHARE_OPERATION + "." + configured
+    operation, _, digest = configured.partition(".")
+    if operation == SHARE_OPERATION and _QUERY_HASH.fullmatch(digest):
+        return configured
+    raise PreSendFailure(f"{SHARE_QUERY_ENV} must be {SHARE_OPERATION}.<32 hex> or the 32 hex hash")
+
+
+def share_payload(text: str, query_id: str) -> dict:
+    return {"variables": {"post": {
+                "allowedCommentersScope": "ALL", "intendedShareLifeCycleState": "PUBLISHED",
+                "origin": "FEED", "visibilityDataUnion": {"visibilityType": "ANYONE"},
+                "commentary": {"text": text, "attributesV2": []}}},
+            "queryId": query_id, "includeWebMetadata": True}
+
+
+def share_receipt(data) -> tuple[str | None, list[str]]:
+    """Return the created share URN (if any) and any GraphQL error messages."""
+    if not isinstance(data, dict):
+        return None, []
+    errors = []
+    outer = data.get("data")
+    for holder in (data, outer if isinstance(outer, dict) else {}):
+        found = holder.get("errors")
+        if isinstance(found, list):
+            for error in found:
+                message = error.get("message") if isinstance(error, dict) else error
+                errors.append(message if isinstance(message, str) and message.strip() else "unnamed error")
+    inner = outer.get("data") if isinstance(outer, dict) else None
+    result = inner.get(SHARE_RESULT) if isinstance(inner, dict) else None
+    if isinstance(result, dict):
+        for key in ("resourceKey", "*entity", "entityUrn"):
+            value = result.get(key)
+            match = _SHARE_URN.fullmatch(value) if isinstance(value, str) else None
+            if match:
+                return match.group(1), errors
+    return None, errors
 
 
 def identity(data: dict) -> dict:
@@ -172,35 +226,32 @@ class LinkedInAdapter:
             raise AuthUnavailable("LinkedIn browser login is required")
         if not account_key_matches(entry, job.get("account_key")):
             raise PreSendFailure("LinkedIn job account key mismatch")
+        query_id = share_query_id()
         try:
-            me = self.me(job["account"])
+            self.me(job["account"])
         except LinkedInReadFailure:
             raise PreSendFailure("LinkedIn identity could not be verified") from None
-        payload = {"author": me["author_urn"], "commentary": little_text(job["body"]),
-                   "visibility": "PUBLIC", "lifecycleState": "PUBLISHED",
-                   "distribution": {"feedDistribution": "MAIN_FEED", "targetEntities": [],
-                                    "thirdPartyDistributionChannels": []}}
+        payload = share_payload(job["body"], query_id)
         attempted = False
         try:
-            with self._session(job["account"]) as headers:
+            with self._session(job["account"]) as session_headers:
+                headers = {**session_headers, "Content-Type": "application/json; charset=UTF-8",
+                           "X-Li-Graphql-Pegasus-Client": "true",
+                           "X-Li-Pem-Metadata": "Voyager - Sharing - CreateShare=sharing-create-content",
+                           "Origin": BASE, "Referer": BASE + "/feed/"}
+                secrets = [v for c in self.http.cookies if c.value for v in (c.value, c.value.strip('"'))]
                 if before_send:
                     before_send()
                 attempted = True
                 try:
-                    response = self.http.post(API + "feed/updates", json=payload, headers=headers,
-                                              timeout=30, allow_redirects=False)
+                    response = self.http.post(API + "graphql", params={"action": "execute", "queryId": query_id},
+                                              json=payload, headers=headers, timeout=30, allow_redirects=False)
                 except Exception as exc:
                     if request_never_sent(exc):
                         raise PreSendFailure(
                             f"LinkedIn request never left this machine ({type(exc).__name__})") from None
                     raise
-                if definite_rejection(response.status_code):
-                    raise PublishRejected(f"LinkedIn rejected the post with HTTP {response.status_code}",
-                                          status_code=response.status_code)
-                provider_id = response.headers.get("x-restli-id", "")
-                if response.status_code not in (200, 201) or not re.fullmatch(r"urn:li:(?:share|ugcPost|activity):\d+", provider_id):
-                    raise PublishUncertain("LinkedIn did not return a confirmed post receipt")
-                receipt = {"provider_id": provider_id, "permalink": BASE + "/feed/update/" + provider_id}
+                receipt = self._share_outcome(response, secrets)
             return {**receipt, "session_saved": self.session_saved}
         except (PreSendFailure, PublishUncertain):
             raise
@@ -208,3 +259,35 @@ class LinkedInAdapter:
             if attempted:
                 raise PublishUncertain("LinkedIn send outcome requires reconciliation") from None
             raise
+
+    @staticmethod
+    def _share_outcome(response, secrets) -> dict:
+        status = response.status_code
+        excerpt = safe_excerpt(getattr(response, "text", ""), secrets=secrets)
+        if status in (401, 403):
+            raise AuthUnavailable(f"LinkedIn refused the session with HTTP {status}")
+        if 300 <= status < 400:
+            location = (response.headers.get("Location") or "").split("?", 1)[0]
+            if any(part in location for part in _LOGIN_PATHS):
+                raise AuthUnavailable(f"LinkedIn redirected the post to sign-in (HTTP {status})")
+            raise PublishUncertain(f"LinkedIn answered the post with a redirect (HTTP {status})",
+                                   status_code=status, excerpt=excerpt)
+        if definite_rejection(status):
+            raise PublishRejected(f"LinkedIn rejected the post with HTTP {status}",
+                                  status_code=status, excerpt=excerpt)
+        if status not in (200, 201):
+            raise PublishUncertain(f"LinkedIn answered the post with HTTP {status}",
+                                   status_code=status, excerpt=excerpt)
+        try:
+            data = response.json()
+        except ValueError:
+            raise PublishUncertain(f"LinkedIn post answer was unreadable (HTTP {status})",
+                                   status_code=status, excerpt=excerpt) from None
+        provider_id, errors = share_receipt(data)
+        if provider_id:
+            return {"provider_id": provider_id, "permalink": BASE + "/feed/update/" + provider_id + "/"}
+        if errors:
+            raise PublishRejected(f"LinkedIn rejected the post (HTTP {status} with errors)",
+                                  status_code=status, excerpt=safe_excerpt("; ".join(errors), secrets=secrets))
+        raise PublishUncertain("LinkedIn did not return a confirmed post receipt",
+                               status_code=status, excerpt=excerpt)

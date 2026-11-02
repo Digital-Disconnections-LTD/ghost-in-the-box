@@ -29,10 +29,15 @@ Cookie rotation is persisted, redirects are disabled, and reads use bounded page
 
 Text-only posts use `outbox draft --platform linkedin`, `outbox queue JOB_ID`,
 then `publish JOB_ID`. Delivery validates the frozen body and signed-in identity,
-sends once, and requires a provider ID receipt. Missing/ambiguous receipts remain
-uncertain for reconciliation. Posting is experimental and has not been exercised
-against a real signed-in account in the offline tests. Media, comment writes,
-reactions, message sends, and organization publishing are not implemented.
+sends once through the share call LinkedIn's current web client uses (Voyager
+GraphQL `voyagerContentcreationDashShares`), and requires a share URN receipt.
+LinkedIn rotates that call's query id; when posts start failing with an invalid
+query, set `SOCIAL_FARM_LINKEDIN_SHARE_QUERY_ID` (see [configuration](configuration.md)).
+LinkedIn reports some refusals as HTTP 200 with an error list; those fail the job
+as rejected. A failed job keeps the HTTP status and a short sanitised excerpt of
+LinkedIn's answer in `last_error`. Missing/ambiguous receipts remain uncertain for
+reconciliation. Media, comment writes, reactions, message sends, and organization
+publishing are not implemented.
 `posts` reads your own posts, not a feed. Profile, post, conversation and
 message commands return provider JSON to your terminal;
 redirect it only to private files when retaining personal content.

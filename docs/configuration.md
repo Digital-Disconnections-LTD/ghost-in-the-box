@@ -92,6 +92,7 @@ Every setting is optional.
 | `SOCIAL_FARM_CHAT_PATH` | A script that delivers Threads notification batches (see below). | none | `threads-notifications` |
 | `SOCIAL_FARM_THREADS_NOTIFY_AGENT` | Default `--notify-agent` recipient for `threads-notifications sync`. | none | `threads-notifications` |
 | `SOCIAL_FARM_ACCOUNT` | The Threads account for the Threads publish systemd unit. Only systemd reads it. | none | systemd units |
+| `SOCIAL_FARM_LINKEDIN_SHARE_QUERY_ID` | The GraphQL query id LinkedIn's web client uses to create a post. LinkedIn rotates it; set the full `voyagerContentcreationDashShares.<hash>` or just the 32-character hash. | `voyagerContentcreationDashShares.279996efa5064c01775d5aff003d9377` | `publish` |
 
 `ghost-in-the-box config` prints this same list with your current values.
 

@@ -12,6 +12,10 @@ whether a claimed outbox job is released, failed, or held as uncertain:
   answer), so nothing was published.
 - ``PublishUncertain``: a write may have reached the provider (timeout, 5xx,
   unreadable answer). The job must be reconciled, never resent automatically.
+
+``PublishRejected`` and ``PublishUncertain`` accept an ``excerpt`` of the
+provider's answer. It is reduced by ``safe_excerpt`` when the exception is built,
+so the router can store it with the reason without storing a raw body.
 """
 
 from __future__ import annotations
@@ -20,9 +24,30 @@ import re
 from typing import Callable, Protocol, runtime_checkable
 
 REASON_LIMIT = 160
+EXCERPT_LIMIT = 300
 _REASON_TEXT = re.compile(r"[A-Za-z0-9 .,:;()/'_\-]+")
+_NOT_REASON_TEXT = re.compile(r"[^A-Za-z0-9 .,:;()/'_\-]+")
 # A long unbroken run with digits looks like a token, cookie or ID, not prose.
 _SECRET_LIKE = re.compile(r"(?=[A-Za-z0-9+/=_\-]*\d)[A-Za-z0-9+/=_\-]{24,}")
+
+
+def safe_excerpt(text, *, secrets=(), limit: int = EXCERPT_LIMIT) -> str:
+    """Reduce a provider answer to a short excerpt that safe_reason accepts.
+
+    Known secret values (cookies, CSRF tokens) are cut out first, then token-like
+    runs, then every character safe_reason would refuse (quotes, braces, '=',
+    '@', newlines). What is left is the readable words of the answer.
+    """
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    if not isinstance(text, str):
+        return ""
+    for secret in sorted((s for s in secrets if isinstance(s, str) and len(s) >= 4), key=len, reverse=True):
+        text = text.replace(secret, " ")
+    text = _SECRET_LIKE.sub(" redacted ", text)
+    text = _NOT_REASON_TEXT.sub(" ", text)
+    text = _SECRET_LIKE.sub("redacted", text)
+    return " ".join(text.split())[:max(limit, 0)].strip()
 
 
 class PreSendFailure(Exception):
@@ -45,16 +70,30 @@ class DependencyUnavailable(AuthUnavailable):
         self.install_hint = install_hint
 
 
+def _with_excerpt(message: str, excerpt) -> tuple[str, str | None]:
+    reduced = safe_excerpt(excerpt) if excerpt else ""
+    return (f"{message}: {reduced}" if reduced else message), (reduced or None)
+
+
 class PublishRejected(PreSendFailure):
     """The provider definitely refused the write; nothing was published."""
 
-    def __init__(self, message: str, *, status_code: int | None = None):
+    def __init__(self, message: str, *, status_code: int | None = None, excerpt: str | None = None):
+        message, self.excerpt = _with_excerpt(message, excerpt)
         super().__init__(message)
         self.status_code = status_code
 
 
 class PublishUncertain(Exception):
     """A write may have reached the provider; reconcile before any retry."""
+
+    def __init__(self, *args, status_code: int | None = None, excerpt: str | None = None):
+        self.excerpt = None
+        if excerpt and len(args) == 1 and isinstance(args[0], str):
+            message, self.excerpt = _with_excerpt(args[0], excerpt)
+            args = (message,)
+        super().__init__(*args)
+        self.status_code = status_code
 
 
 class ReadFailure(Exception):
