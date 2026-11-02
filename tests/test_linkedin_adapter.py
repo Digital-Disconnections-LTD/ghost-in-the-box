@@ -1,8 +1,12 @@
 from contextlib import redirect_stdout
 import hashlib
+import importlib.util
 import io
 import json
 from pathlib import Path
+import struct
+import sys
+import zlib
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -16,9 +20,10 @@ from urllib3.exceptions import NewConnectionError
 import farm.adapters as shared
 from farm import config
 from farm.accounts import AccountRegistry
-from farm.adapters.linkedin import (SHARE_QUERY_ENV, SHARE_QUERY_ID, AuthUnavailable, LinkedInAdapter,
-                                    LinkedInReadFailure, PreSendFailure, PublishRejected,
-                                    PublishUncertain, identity, little_text)
+from farm.adapters.linkedin import (ALT_TEXT_LIMIT, MAX_IMAGE_BYTES, SHARE_QUERY_ENV, SHARE_QUERY_ID,
+                                    SINGLE_IMAGE_ONLY, AuthUnavailable, LinkedInAdapter,
+                                    LinkedInReadFailure, LinkedInUploadFailure, PreSendFailure,
+                                    PublishRejected, PublishUncertain, identity, little_text, read_image)
 from farm.login import save_login
 from farm.outbox import Outbox
 from farm.session_files import read_session
@@ -35,6 +40,28 @@ def unreadable(status=200, text="<html>gateway</html>"):
     def fail():
         raise ValueError("not JSON")
     return SimpleNamespace(status_code=status, json=fail, headers={}, text=text)
+
+
+def png_bytes(width=2, height=2):
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    rows = b"".join(b"\x00" + b"\xff\x00\x00" * width for _ in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+def jpeg_bytes():
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    output = io.BytesIO()
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(output, "JPEG")
+    return output.getvalue()
+
+
+def pillow_available():
+    return importlib.util.find_spec("PIL") is not None
 
 
 ME = {"miniProfile": {"publicIdentifier": "mine", "entityUrn": "urn:li:fs_miniProfile:ABC123"}}
@@ -339,6 +366,291 @@ class LinkedInTests(unittest.TestCase):
 
     def test_little_text_keeps_hashtags_and_escapes_url_fragments(self):
         self.assertEqual(little_text("#code https://example.com/#anchor #1"), "#code https://example.com/\\#anchor \\#1")
+
+
+REGISTER_URL = "https://www.linkedin.com/voyager/api/voyagerVideoDashMediaUploadMetadata"
+GRAPHQL_URL = "https://www.linkedin.com/voyager/api/graphql"
+UPLOAD_URL = ("https://www.linkedin.com/dms-uploads/sp/v2/D4E10AQH0example/uploaded-image/0"
+              "?ca=vector_feedshare&cn=uploads")
+ASSET = "urn:li:digitalmediaAsset:D4E10AQH0example"
+
+
+def registered(**value):
+    return {"data": {"value": {"urn": ASSET, "singleUploadUrl": UPLOAD_URL,
+                               "singleUploadHeaders": {"media-type-family": "STILLIMAGE"},
+                               "type": "SINGLE", **value}}, "included": []}
+
+
+class LinkedInImageTests(unittest.TestCase):
+    def setUp(self):
+        LinkedInTests.setUp(self)
+        self.image = self.root / "photo.png"
+        self.image.write_bytes(png_bytes())
+        self.job.update(media_path=str(self.image), media_sha256=hashlib.sha256(self.image.read_bytes()).hexdigest(),
+                        media_alt="A red square")
+        self.order = Mock()
+        self.register_answer = response(registered())
+        self.share_answer = response(SHARED)
+
+        def post(url, *args, **kwargs):
+            if url == REGISTER_URL:
+                self.order.register()
+                return self.register_answer
+            self.order.share()
+            return self.share_answer
+
+        def put(*args, **kwargs):
+            self.order.put()
+            return response(status=201, text="")
+
+        self.http.post.side_effect = post
+        self.http.put.side_effect = put
+        self.boundary = Mock(side_effect=self.order.before_send)
+
+    def calls(self, url):
+        return [c for c in self.http.post.call_args_list if c.args[0] == url]
+
+    def assertNothingPosted(self):
+        self.assertEqual(self.calls(GRAPHQL_URL), [])
+        self.boundary.assert_not_called()
+
+    def test_image_post_registers_uploads_then_shares_with_one_boundary(self):
+        result = self.adapter.publish(self.job, before_send=self.boundary)
+        self.assertEqual(result["provider_id"], "urn:li:share:123")
+        self.assertEqual([c[0] for c in self.order.mock_calls], ["register", "put", "before_send", "share"])
+        self.boundary.assert_called_once()
+
+        register = self.calls(REGISTER_URL)[0]
+        self.assertEqual(register.kwargs["params"], {"action": "upload"})
+        self.assertEqual(register.kwargs["json"], {"mediaUploadType": "IMAGE_SHARING",
+                                                   "fileSize": len(png_bytes()), "filename": "photo.png"})
+        self.assertFalse(register.kwargs["allow_redirects"])
+        headers = CaseInsensitiveDict(register.kwargs["headers"])
+        self.assertEqual(headers["csrf-token"], "ajax:123")
+        self.assertEqual(headers["accept"], "application/vnd.linkedin.normalized+json+2.1")
+        self.assertEqual(headers["x-restli-protocol-version"], "2.0.0")
+        self.assertEqual(headers["x-li-lang"], "en_US")
+        self.assertEqual(headers["content-type"], "application/json")
+
+        upload = self.http.put.call_args
+        self.assertEqual(self.http.put.call_count, 1)
+        self.assertEqual(upload.args[0], UPLOAD_URL)
+        self.assertEqual(upload.kwargs["data"], png_bytes())
+        self.assertFalse(upload.kwargs["allow_redirects"])
+        put_headers = CaseInsensitiveDict(upload.kwargs["headers"])
+        self.assertEqual(put_headers["media-type-family"], "STILLIMAGE")
+        self.assertEqual(put_headers["content-type"], "image/png")
+        self.assertEqual(put_headers["user-agent"], "TEST_UA")
+        self.assertNotIn("csrf-token", put_headers)
+
+        share = self.calls(GRAPHQL_URL)[0]
+        self.assertEqual(share.kwargs["params"], {"action": "execute", "queryId": SHARE_QUERY_ID})
+        post = share.kwargs["json"]["variables"]["post"]
+        self.assertEqual(post["commentary"], {"text": "Exact #text [test]", "attributesV2": []})
+        self.assertEqual(post["media"], {"category": "IMAGE", "mediaUrn": ASSET, "tapTargets": [],
+                                         "altText": "A red square"})
+
+    def test_missing_alt_text_is_sent_as_empty(self):
+        self.job["media_alt"] = None
+        self.adapter.publish(self.job)
+        self.assertEqual(self.calls(GRAPHQL_URL)[0].kwargs["json"]["variables"]["post"]["media"]["altText"], "")
+
+    def test_text_only_share_body_is_unchanged(self):
+        self.job.update(media_path=None, media_sha256=None, media_alt=None)
+        self.adapter.publish(self.job, before_send=self.boundary)
+        self.assertEqual([c[0] for c in self.order.mock_calls], ["before_send", "share"])
+        self.http.put.assert_not_called()
+        self.assertEqual(self.calls(REGISTER_URL), [])
+        self.assertEqual(json.dumps(self.calls(GRAPHQL_URL)[0].kwargs["json"]), (
+            '{"variables": {"post": {"allowedCommentersScope": "ALL", "intendedShareLifeCycleState": '
+            '"PUBLISHED", "origin": "FEED", "visibilityDataUnion": {"visibilityType": "ANYONE"}, '
+            '"commentary": {"text": "Exact #text [test]", "attributesV2": []}}}, '
+            '"queryId": "voyagerContentcreationDashShares.279996efa5064c01775d5aff003d9377", '
+            '"includeWebMetadata": true}'))
+
+    def test_register_refusing_the_session_is_auth_unavailable(self):
+        for status, headers in ((401, {}), (403, {}),
+                                (302, {"Location": "https://www.linkedin.com/uas/login?x=1"})):
+            with self.subTest(status=status):
+                self.register_answer = response(status=status, headers=headers, text="TEST_COOKIE")
+                with self.assertRaises(AuthUnavailable) as caught:
+                    self.adapter.publish(self.job, before_send=self.boundary)
+                self.assertNotIn("TEST_COOKIE", str(caught.exception))
+                self.http.put.assert_not_called()
+                self.assertNothingPosted()
+
+    def test_register_client_error_is_pre_send_with_a_sanitised_excerpt(self):
+        self.register_answer = response(status=400, text=json.dumps(
+            {"message": "Invalid upload request", "status": 400, "echo": 'JSESSIONID="ajax:123"; li_at=TEST_COOKIE'}))
+        with self.assertRaises(LinkedInUploadFailure) as caught:
+            self.adapter.publish(self.job, before_send=self.boundary)
+        error = caught.exception
+        self.assertIsInstance(error, PreSendFailure)
+        self.assertNotIsInstance(error, (PublishRejected, AuthUnavailable))
+        self.assertEqual(error.status_code, 400)
+        self.assertIn("HTTP 400", str(error))
+        self.assertIn("Invalid upload request", error.excerpt)
+        for secret in ("TEST_COOKIE", "ajax:123", '"', "{"):
+            self.assertNotIn(secret, str(error))
+        self.http.put.assert_not_called()
+        self.assertNothingPosted()
+
+    def test_register_server_error_or_timeout_is_pre_send_not_uncertain(self):
+        self.register_answer = response(status=503, text="<html>Service unavailable</html>")
+        with self.assertRaisesRegex(LinkedInUploadFailure, "Service unavailable"):
+            self.adapter.publish(self.job, before_send=self.boundary)
+        self.http.post.side_effect = requests.Timeout("PRIVATE_RESPONSE")
+        with self.assertRaises(PreSendFailure) as caught:
+            self.adapter.publish(self.job, before_send=self.boundary)
+        self.assertNotIn("PRIVATE_RESPONSE", str(caught.exception))
+        self.assertNothingPosted()
+
+    def test_upload_server_error_or_timeout_is_pre_send(self):
+        self.http.put.side_effect = lambda *a, **k: response(status=500, text="upload broke")
+        with self.assertRaisesRegex(LinkedInUploadFailure, "image upload failed with HTTP 500: upload broke"):
+            self.adapter.publish(self.job, before_send=self.boundary)
+        self.http.put.side_effect = requests.ConnectionError("PRIVATE")
+        with self.assertRaises(PreSendFailure) as caught:
+            self.adapter.publish(self.job, before_send=self.boundary)
+        self.assertNotIsInstance(caught.exception, PublishRejected)
+        self.assertNothingPosted()
+
+    def test_upload_refusing_the_session_is_auth_unavailable(self):
+        self.http.put.side_effect = lambda *a, **k: response(status=403, text="")
+        with self.assertRaises(AuthUnavailable):
+            self.adapter.publish(self.job, before_send=self.boundary)
+        self.assertNothingPosted()
+
+    def test_multipart_upload_is_refused_before_any_upload(self):
+        self.register_answer = response(registered(type="MULTIPART"))
+        with self.assertRaisesRegex(PreSendFailure, "multipart upload not supported"):
+            self.adapter.publish(self.job, before_send=self.boundary)
+        self.http.put.assert_not_called()
+        self.assertNothingPosted()
+
+    def test_unexpected_registration_answers_are_refused_before_any_upload(self):
+        for answer in (registered(urn="urn:li:share:1"),
+                       registered(singleUploadUrl="https://uploads.example.com/x"),
+                       registered(singleUploadUrl="http://www.linkedin.com/dms-uploads/x"),
+                       registered(singleUploadHeaders={"bad header": "x"}),
+                       registered(singleUploadHeaders={"x-ok": "a\r\nInjected: 1"}),
+                       {"data": {}}):
+            with self.subTest(answer=answer):
+                self.register_answer = response(answer)
+                with self.assertRaises(LinkedInUploadFailure):
+                    self.adapter.publish(self.job, before_send=self.boundary)
+        self.register_answer = unreadable(status=200, text="<html>not json</html>")
+        with self.assertRaisesRegex(LinkedInUploadFailure, "unreadable"):
+            self.adapter.publish(self.job, before_send=self.boundary)
+        self.http.put.assert_not_called()
+        self.assertNothingPosted()
+
+    def test_a_carousel_manifest_is_refused_as_more_than_one_image(self):
+        manifest = self.root / "carousel.json"
+        manifest.write_text('{"items": [1, 2]}', encoding="utf-8")
+        self.job.update(media_path=str(manifest), media_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest())
+        with self.assertRaisesRegex(PreSendFailure, SINGLE_IMAGE_ONLY):
+            self.adapter.publish(self.job, before_send=self.boundary)
+        self.http.get.assert_not_called()
+        self.http.post.assert_not_called()
+
+    def test_image_changed_after_queue_is_refused_before_any_request(self):
+        self.image.write_bytes(png_bytes(3, 3))
+        with self.assertRaisesRegex(PreSendFailure, "changed before send"):
+            self.adapter.publish(self.job, before_send=self.boundary)
+        self.http.post.assert_not_called()
+
+    def test_alt_text_limits_are_checked_before_any_request(self):
+        for alt in ("x" * (ALT_TEXT_LIMIT + 1), "two\nlines"):
+            with self.subTest(alt=alt[:10]):
+                self.job["media_alt"] = alt
+                with self.assertRaisesRegex(PreSendFailure, "alt text"):
+                    self.adapter.publish(self.job, before_send=self.boundary)
+        self.job.update(media_path=None, media_sha256=None, media_alt="orphan")
+        with self.assertRaisesRegex(PreSendFailure, "needs an image"):
+            self.adapter.publish(self.job)
+        self.http.post.assert_not_called()
+
+    def test_mime_comes_from_magic_bytes_not_the_extension(self):
+        named_jpg = self.root / "really-png.jpg"
+        named_jpg.write_bytes(png_bytes())
+        self.assertEqual(read_image(named_jpg)[1], "image/png")
+        self.assertEqual(shared.image_mime(b"GIF89a" + b"\x00" * 8), "image/gif")
+        self.assertEqual(shared.image_mime(b"RIFF\x00\x00\x00\x00WEBPVP8 "), "image/webp")
+        fake = self.root / "notes.jpg"
+        fake.write_text("just some text, not a photo", encoding="utf-8")
+        with self.assertRaisesRegex(PreSendFailure, "JPEG, PNG, GIF or WebP"):
+            read_image(fake)
+
+    def test_jpeg_is_detected_and_uploaded_with_its_type(self):
+        data = jpeg_bytes()
+        if data is None:
+            self.skipTest("Pillow is not installed")
+        photo = self.root / "photo.jpeg"
+        photo.write_bytes(data)
+        self.assertEqual(read_image(photo), (data, "image/jpeg"))
+        self.job.update(media_path=str(photo), media_sha256=hashlib.sha256(data).hexdigest())
+        self.adapter.publish(self.job)
+        self.assertEqual(CaseInsensitiveDict(self.http.put.call_args.kwargs["headers"])["content-type"], "image/jpeg")
+
+    def test_without_pillow_magic_bytes_decide(self):
+        photo = self.root / "photo.jpg"
+        photo.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 32)
+        with patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            self.assertEqual(read_image(photo)[1], "image/jpeg")
+        if pillow_available():
+            with self.assertRaisesRegex(PreSendFailure, "could not be decoded as image/jpeg"):
+                read_image(photo)
+
+    def test_pillow_refuses_a_broken_image_behind_a_valid_signature(self):
+        if not pillow_available():
+            self.skipTest("Pillow is not installed")
+        broken = self.root / "broken.png"
+        broken.write_bytes(png_bytes()[:40])
+        with self.assertRaisesRegex(PreSendFailure, "could not be decoded as image/png"):
+            read_image(broken)
+
+    def test_size_cap_is_enforced_before_reading(self):
+        large = self.root / "large.png"
+        with large.open("wb") as handle:
+            handle.write(png_bytes())
+            handle.truncate(MAX_IMAGE_BYTES + 1)
+        with self.assertRaisesRegex(PreSendFailure, "larger than 8 MiB"):
+            read_image(large)
+        self.job.update(media_path=str(large), media_sha256=None)
+        with self.assertRaises(PreSendFailure):
+            self.adapter.publish(self.job)
+        self.http.post.assert_not_called()
+
+    def queued_image_job(self, db):
+        with patch("farm.outbox.AccountRegistry", return_value=self.registry), Outbox(db) as box:
+            draft = box.create_draft(platform="linkedin", account="mine", body="exact text",
+                                     media_path=str(self.image), media_alt="A red square")
+            return box.queue(draft["id"])
+
+    def test_router_publishes_an_image_job_from_the_outbox(self):
+        db = self.root / "outbox.sqlite3"
+        job = self.queued_image_job(db)
+        with redirect_stdout(io.StringIO()) as output:
+            code = run(job["id"], box_factory=lambda: Outbox(db), linkedin_factory=lambda: self.adapter)
+        self.assertEqual((code, json.loads(output.getvalue())["status"]), (0, "published"))
+        self.assertEqual([c[0] for c in self.order.mock_calls], ["register", "put", "share"])
+        media = self.calls(GRAPHQL_URL)[0].kwargs["json"]["variables"]["post"]["media"]
+        self.assertEqual(media["altText"], "A red square")
+
+    def test_router_marks_a_failed_upload_as_failed_before_send_with_the_excerpt(self):
+        db = self.root / "outbox.sqlite3"
+        job = self.queued_image_job(db)
+        self.register_answer = response(status=400, text='{"message":"File too large"}')
+        with redirect_stdout(io.StringIO()) as output:
+            code = run(job["id"], box_factory=lambda: Outbox(db), linkedin_factory=lambda: self.adapter)
+        self.assertEqual((code, json.loads(output.getvalue())["status"]), (1, "failed_before_send"))
+        with Outbox(db) as box:
+            stored = box.get(job["id"])
+        self.assertEqual((stored["status"], stored["failure_kind"]), ("failed", "pre_send"))
+        self.assertEqual(stored["last_error"],
+                         "LinkedIn image registration failed with HTTP 400: message : File too large")
+        self.assertEqual(self.calls(GRAPHQL_URL), [])
 
 
 if __name__ == "__main__":

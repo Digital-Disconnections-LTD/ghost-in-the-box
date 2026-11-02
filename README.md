@@ -38,7 +38,7 @@ New words such as brief, lane, frozen job or Bat are explained in
 | **Instagram** | Session registry, own-writing importer, inbox, comments, carousel drafts, exact-job publishing, and MCP tools. |
 | **Threads** | Post and reply readers, inbox triage, queued posts and replies, cadence (post spacing and quiet hours), and publishing adapters. Account setup and provider authentication are required. Browser helpers are optional. |
 | **Substack** | Optional SDK-backed MCP connector, persistent cookies, setup status, and publication receipts. |
-| **LinkedIn** | Browser login, reads of your identity, a profile, your own posts, your conversation list and messages, and experimental text-post delivery through the outbox. |
+| **LinkedIn** | Browser login, reads of your identity, a profile, your own posts, your conversation list and messages, experimental delivery of text and single-image posts through the outbox, and MCP tools. |
 | **Brief engine** | Source-linked briefs and draft files for Instagram, Threads, Substack, LinkedIn, Facebook, TikTok, and YouTube. |
 
 Facebook, TikTok, and YouTube currently have **brief formats**, not
@@ -120,10 +120,10 @@ to a server. Every step is in the [login guide](docs/login.md).
 ## Bring a Bat, or your favorite MCP client 👻 (agents and MCP)
 
 Ghost in the Box works alongside [Batbox](https://github.com/Digital-Disconnections-LTD/batbox),
-Claude Desktop, Claude Code and other MCP clients. The Instagram and Substack
-servers speak standard MCP over stdio. Ready-made client configs live in
-[examples/](examples/README.md). Threads and LinkedIn are CLI-only today; an agent
-reaches them through the `ghost-in-the-box` command.
+Claude Desktop, Claude Code, Codex CLI and other MCP clients. The Instagram,
+LinkedIn and Substack servers speak standard MCP over stdio. Ready-made client
+configs live in [examples/](examples/README.md). Threads is CLI-only today; an
+agent reaches it through the `ghost-in-the-box` command.
 
 [Set up MCP →](docs/mcp.md) · [Connect the platforms →](docs/connectors.md) · [Follow the agent workflow →](docs/agent-workflow.md)
 

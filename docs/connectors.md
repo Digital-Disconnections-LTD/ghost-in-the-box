@@ -2,7 +2,7 @@
 
 Use the [cross-platform login wizard](login.md) to create sessions and move
 selected accounts between your desktop and server. MCP client setup (Claude
-Desktop, Claude Code, Batbox) is in [MCP tools](mcp.md). Every command is in the
+Desktop, Claude Code, Codex CLI, Batbox) is in [MCP tools](mcp.md). Every command is in the
 [command index](commands.md).
 
 | Platform | CLI | MCP |
@@ -10,7 +10,7 @@ Desktop, Claude Code, Batbox) is in [MCP tools](mcp.md). Every command is in the
 | Instagram | yes | yes (`instagram-mcp`) |
 | Substack | setup only | yes (`substack-mcp`) |
 | Threads | yes | no, CLI only today |
-| LinkedIn | yes | no, CLI only today |
+| LinkedIn | yes | yes (`linkedin-mcp`) |
 
 ## LinkedIn
 
@@ -27,7 +27,7 @@ is undocumented, so its request and response shapes can change without notice.
 Each read validates the account.
 Cookie rotation is persisted, redirects are disabled, and reads use bounded pages.
 
-Text-only posts use `outbox draft --platform linkedin`, `outbox queue JOB_ID`,
+Posts use `outbox draft --platform linkedin`, `outbox queue JOB_ID`,
 then `publish JOB_ID`. Delivery validates the frozen body and signed-in identity,
 sends once through the share call LinkedIn's current web client uses (Voyager
 GraphQL `voyagerContentcreationDashShares`), and requires a share URN receipt.
@@ -36,14 +36,30 @@ query, set `SOCIAL_FARM_LINKEDIN_SHARE_QUERY_ID` (see [configuration](configurat
 LinkedIn reports some refusals as HTTP 200 with an error list; those fail the job
 as rejected. A failed job keeps the HTTP status and a short sanitised excerpt of
 LinkedIn's answer in `last_error`. Missing/ambiguous receipts remain uncertain for
-reconciliation. Media, comment writes, reactions, message sends, and organization
+reconciliation.
+
+A post can carry one image: add `--media PATH` (JPEG, PNG, GIF or WebP, at most
+8 MiB, checked by its bytes rather than its name) and optional `--alt TEXT` to
+`outbox draft --platform linkedin`. `publish --dry-run JOB_ID` shows the image's
+path, type, size and alt text. On send, the image is registered and uploaded
+first; a failed upload creates no post and fails the job before sending. Two or
+more images, video, comment writes, reactions, message sends, and organization
 publishing are not implemented.
+
+For agents, `linkedin-mcp` exposes the same reads and the outbox steps as 15
+tools: `linkedin_status` (local, no network), the five reads, then
+`linkedin_draft_post`, `linkedin_queue_job`, `linkedin_dry_run` and
+`linkedin_publish_job`, which runs the same publisher as `publish JOB_ID`, plus
+the list, show, cancel, retry and resolve steps. Setup and the full tool list
+are in [MCP tools](mcp.md).
+
 `posts` reads your own posts, not a feed. Profile, post, conversation and
 message commands return provider JSON to your terminal;
 redirect it only to private files when retaining personal content.
 
 Network boundary: LinkedIn requests carry the selected session to
-`https://www.linkedin.com/voyager/api/`. The login browser can visit LinkedIn and
+`https://www.linkedin.com/voyager/api/`. An image is uploaded to the HTTPS upload
+address LinkedIn returns, which must be on `linkedin.com` or `licdn.com`. The login browser can visit LinkedIn and
 the identity provider you choose; only LinkedIn cookies are retained.
 
 ## Instagram

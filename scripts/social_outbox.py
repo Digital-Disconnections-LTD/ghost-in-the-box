@@ -2,6 +2,8 @@
 """Manage the private, durable social publishing outbox.
 
   ghost-in-the-box outbox draft --platform threads --account HANDLE --body-file post.txt
+  ghost-in-the-box outbox draft --platform linkedin --account HANDLE --body-file post.txt \
+      --media photo.png --alt "What the photo shows"
   ghost-in-the-box outbox list
   ghost-in-the-box outbox queue JOB_ID [--at 2026-11-02T09:00:00-05:00]
   ghost-in-the-box publish --dry-run JOB_ID
@@ -20,6 +22,7 @@ from farm.accounts import check_handle, handle_rule
 from farm.cli_output import (
     EXIT_USAGE, add_body_arguments, choice_error, fail, guarded, read_body, succeed,
 )
+from farm.adapters.linkedin import SINGLE_IMAGE_ONLY
 from farm.outbox import (
     ACTIONS, JOB_STATES, PUBLISHABLE_PLATFORMS, Outbox, OutboxError, check_platform,
     parse_time,
@@ -55,7 +58,9 @@ def _parser() -> argparse.ArgumentParser:
     draft.add_argument("--action", choices=ACTIONS, default="post")
     draft.add_argument("--account-key", metavar="KEY",
                        help="shared session key, e.g. meta:HANDLE for Instagram and Threads")
-    draft.add_argument("--media", metavar="PATH", help="image, video or carousel manifest to attach")
+    draft.add_argument("--media", action="append", metavar="PATH",
+                       help="image, video or carousel manifest to attach (one; LinkedIn takes one image)")
+    draft.add_argument("--alt", metavar="TEXT", help="LinkedIn only: alt text describing the --media image")
     draft.add_argument("--media-id", metavar="ID", help="parent media ID for a comment reply")
     draft.add_argument("--target-id", metavar="ID", help="comment or post ID being replied to")
     draft.add_argument("--target-url", metavar="URL", help="link to the item being replied to")
@@ -133,6 +138,12 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError:
             return fail("invalid_account", f"--account {args.account!r} is not {handle_rule(args.platform)}",
                         "pass your public handle as shown on your profile, without @", EXIT_USAGE)
+        if args.media and len(args.media) > 1:
+            if args.platform == "linkedin":
+                return fail(SINGLE_IMAGE_ONLY, "a LinkedIn post carries exactly one image",
+                            "pass --media once", EXIT_USAGE)
+            return fail("multiple_media", "pass --media once",
+                        "for an Instagram carousel run: ghost-in-the-box carousel --help", EXIT_USAGE)
     if args.command == "list":
         if args.status not in LIST_FILTERS:
             message, hint = choice_error("--status", args.status, LIST_FILTERS)
@@ -155,7 +166,8 @@ def main(argv: list[str] | None = None) -> int:
             result = summary(box.create_draft(
                 platform=args.platform, account=args.account, body=body,
                 action=args.action, account_key=args.account_key,
-                media_path=args.media, media_id=args.media_id, target_id=args.target_id,
+                media_path=args.media[0] if args.media else None, media_alt=args.alt,
+                media_id=args.media_id, target_id=args.target_id,
                 target_url=args.target_url, source_urls=args.source_url,
                 idempotency_key=args.idempotency_key,
                 crosspost_threads=args.crosspost_threads,

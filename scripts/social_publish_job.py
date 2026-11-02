@@ -26,7 +26,7 @@ from farm.adapters import (
 from farm.adapters.instagram import InstagramAdapter
 from farm.adapters.threads import ThreadsAdapter
 from farm.threads_browser import BrowserThreadsAdapter
-from farm.adapters.linkedin import LinkedInAdapter
+from farm.adapters.linkedin import LinkedInAdapter, media_summary as linkedin_media_summary
 from farm import cli_output
 from farm.cli_output import EXIT_AUTH, EXIT_OK, EXIT_RUNTIME, EXIT_UNCERTAIN, EXIT_USAGE
 from farm.config import chromium_install_command, install_command
@@ -296,13 +296,18 @@ def dry_run(box, job: dict, *, now: bool, registry_factory=AccountRegistry) -> t
         blockers.append("account_busy")
     account, account_blockers = _registry_view(registry_factory, job)
     blockers.extend(account_blockers)
+    media = linkedin_media_summary(job) if job["platform"] == "linkedin" else None
+    if media is not None and not media["valid"]:
+        blockers.append("media_invalid")
+    extra = {"media": media} if media is not None else {}
     return EXIT_OK, {
         "ok": True, "status": "dry_run", "job_id": job["id"], "platform": job["platform"],
         "action": job["action"], "job_status": job["status"], "scheduled_at": job["scheduled_at"],
         "due": due,
         "payload": {key: job.get(key) for key in (
-            "body", "media_path", "media_id", "target_id", "target_url", "crosspost_threads",
+            "body", "media_path", "media_alt", "media_id", "target_id", "target_url", "crosspost_threads",
             "source_urls", "body_sha256", "media_sha256")} | {"frozen": frozen, "matches_frozen_hash": matches},
+        **extra,
         "target_account": account,
         "would_publish": not blockers, "blockers": blockers, "network_requests": 0,
     }

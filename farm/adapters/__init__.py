@@ -153,6 +153,24 @@ def definite_rejection(status_code: int | None) -> bool:
     return status_code is not None and 400 <= status_code < 500 and status_code not in (408, 409)
 
 
+def image_mime(data: bytes) -> str | None:
+    """Return the image MIME type proven by data's leading bytes, or None.
+
+    The file name and extension are never consulted.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        return None
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def request_never_sent(exc: BaseException) -> bool:
     """Return True when a requests error proves no request bytes left the machine."""
     try:

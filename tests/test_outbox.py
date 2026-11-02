@@ -7,6 +7,7 @@ import unittest
 
 from farm.outbox import JOB_STATES, SCHEMA_VERSION, Outbox, OutboxError, frozen_payload_matches
 from _env import IsolatedStateTestCase
+from test_linkedin_adapter import png_bytes
 
 
 class OutboxTests(IsolatedStateTestCase):
@@ -304,6 +305,46 @@ class OutboxTests(IsolatedStateTestCase):
         self.assertEqual(raised.exception.code, "account_key_mismatch")
         self.assertTrue(raised.exception.hint)
 
+    def test_linkedin_image_draft_keeps_alt_text_and_queue_freezes_the_image_bytes(self):
+        image = self.root / "photo.png"
+        image.write_bytes(png_bytes())
+        draft = self.draft(platform="linkedin", media_path=str(image), media_alt="  A red square  ",
+                           idempotency_key="linkedin-image")
+        self.assertEqual((draft["media_path"], draft["media_alt"]), (str(image.resolve()), "A red square"))
+        queued = self.box.queue(draft["id"])
+        self.assertEqual(queued["media_sha256"], hashlib.sha256(png_bytes()).hexdigest())
+        self.assertTrue(frozen_payload_matches(queued))
+        image.write_bytes(png_bytes(3, 3))
+        self.assertFalse(frozen_payload_matches(queued))
+        with self.assertRaises(OutboxError) as raised:
+            self.draft(platform="linkedin", media_path=str(image), media_alt="Another description",
+                       idempotency_key="linkedin-image")
+        self.assertEqual(raised.exception.code, "idempotency_conflict")
+
+    def test_linkedin_image_drafts_are_checked_like_the_adapter_checks_them(self):
+        manifest = self.root / "carousel.json"
+        manifest.write_text('{"items": []}', encoding="utf-8")
+        text_as_jpg = self.root / "photo.jpg"
+        text_as_jpg.write_text("not an image", encoding="utf-8")
+        image = self.root / "photo.png"
+        image.write_bytes(png_bytes())
+        cases = (
+            ({"media_path": str(manifest)}, "linkedin_single_image_only"),
+            ({"media_path": str(text_as_jpg)}, "invalid_media"),
+            ({"media_path": str(self.root / "missing.png")}, "invalid_media"),
+            ({"media_path": str(image), "body": "   "}, "linkedin_text_required"),
+            ({"media_path": str(image), "media_alt": "two\nlines"}, "invalid_alt_text"),
+            ({"media_alt": "no image"}, "alt_requires_media"),
+            ({"media_path": str(image), "media_alt": "nice", "platform": "instagram"}, "alt_text_unsupported"),
+        )
+        for kwargs, code in cases:
+            with self.subTest(code=code):
+                with self.assertRaises(OutboxError) as raised:
+                    self.draft(**{"platform": "linkedin", **kwargs})
+                self.assertEqual(raised.exception.code, code)
+                self.assertTrue(raised.exception.hint)
+        self.assertEqual(self.box.list(status="all"), [])
+
     def test_job_states_cover_every_status_the_outbox_writes(self):
         self.assertEqual(JOB_STATES, ("draft", "queued", "in_flight", "uncertain", "published", "failed",
                                       "superseded", "cancelled"))
@@ -356,6 +397,24 @@ class OutboxSchemaTests(IsolatedStateTestCase):
             with self.assertRaises(OutboxError):
                 box.retry_failed("reconciled-job", reason="again")
             self.assertEqual(box.retry_failed("presend-job", reason="again")["status"], "queued")
+        self.assertEqual(self.version(), SCHEMA_VERSION)
+
+    def test_version_2_database_gains_alt_text_and_keeps_old_media_jobs(self):
+        with Outbox(self.path) as box:
+            image = Path(self.temp.name) / "photo.jpg"
+            image.write_bytes(b"photo bytes")
+            job = box.queue(box.create_draft(platform="instagram", account="mine", body="caption",
+                                             media_path=str(image))["id"])
+        db = sqlite3.connect(self.path)
+        db.execute("ALTER TABLE jobs DROP COLUMN media_alt")
+        db.execute("UPDATE schema_version SET version=2")
+        db.commit()
+        db.close()
+        with Outbox(self.path) as box:
+            migrated = box.get(job["id"])
+            self.assertIsNone(migrated["media_alt"])
+            self.assertEqual(migrated["media_sha256"], job["media_sha256"])
+            self.assertTrue(frozen_payload_matches(migrated))
         self.assertEqual(self.version(), SCHEMA_VERSION)
 
     def test_database_from_a_newer_release_is_refused(self):

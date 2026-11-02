@@ -30,7 +30,7 @@ BRIEF_ONLY_PLATFORMS = ("facebook", "tiktok", "youtube")
 PLATFORMS = PUBLISHABLE_PLATFORMS
 ACTIONS = ("post", "reply")
 FAILURE_KINDS = ("pre_send", "rejected")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 BRIEF_ONLY_HINT = ("Facebook, TikTok and YouTube are brief-only: run `ghost-in-the-box brief` and post "
                    "the brief yourself. The outbox publishes to " + ", ".join(PUBLISHABLE_PLATFORMS) + ".")
 
@@ -161,10 +161,43 @@ def _migrate_to_2(db: sqlite3.Connection) -> None:
                   WHERE status='failed' AND failure_kind IS NULL""")
 
 
+def _migrate_to_3(db: sqlite3.Connection) -> None:
+    """Keep optional alt text for a job's image; older rows simply have none."""
+    columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+    if "media_alt" not in columns:
+        db.execute("ALTER TABLE jobs ADD COLUMN media_alt TEXT")
+
+
 # Forward-only migrations: append (version, function) and raise SCHEMA_VERSION.
 # Each function runs once inside the opening transaction and must tolerate a
 # database that already has its columns.
-MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = ((2, _migrate_to_2),)
+MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = (
+    (2, _migrate_to_2), (3, _migrate_to_3))
+
+
+def _check_linkedin_media(media: str, body: str, alt: str | None) -> None:
+    """Refuse a LinkedIn image draft the adapter would refuse at send time."""
+    # Imported here because the adapter imports this module.
+    from farm.adapters.linkedin import (
+        MAX_IMAGE_BYTES, SINGLE_IMAGE_ONLY, PreSendFailure, check_alt_text, read_image,
+    )
+    if Path(media).name == "carousel.json":
+        raise OutboxError("a LinkedIn post carries exactly one image", code=SINGLE_IMAGE_ONLY,
+                          hint="Attach one image with --media PATH, or post the carousel to Instagram.")
+    if not body.strip():
+        raise OutboxError("a LinkedIn image post needs text", code="linkedin_text_required",
+                          hint="Give the post text with --body TEXT or --body-file PATH.")
+    try:
+        read_image(media)
+    except PreSendFailure as exc:
+        raise OutboxError(str(exc), code="invalid_media",
+                          hint=f"Attach a JPEG, PNG, GIF or WebP image of at most "
+                               f"{MAX_IMAGE_BYTES // (1024 * 1024)} MiB.") from None
+    try:
+        check_alt_text(alt)
+    except PreSendFailure as exc:
+        raise OutboxError(str(exc), code="invalid_alt_text",
+                          hint="Shorten the alt text and keep it on one line.") from None
 
 
 class Outbox:
@@ -247,6 +280,7 @@ class Outbox:
         action: str = "post",
         account_key: str | None = None,
         media_path: str | None = None,
+        media_alt: str | None = None,
         media_id: str | None = None,
         target_id: str | None = None,
         target_url: str | None = None,
@@ -266,6 +300,18 @@ class Outbox:
         if crosspost_threads and (platform != "instagram" or action != "post"):
             raise ValueError("Threads cross-post applies only to an Instagram post")
         media = str(Path(media_path).expanduser().resolve()) if media_path else None
+        if media_alt is not None and not isinstance(media_alt, str):
+            raise OutboxError("alt text must be text", code="invalid_alt_text",
+                              hint="Pass the image description with --alt TEXT.")
+        alt = media_alt.strip() if media_alt and media_alt.strip() else None
+        if alt is not None and not media:
+            raise OutboxError("alt text describes an attached image", code="alt_requires_media",
+                              hint="Add --media PATH, or leave out --alt.")
+        if alt is not None and platform != "linkedin":
+            raise OutboxError(f"alt text is not supported for {platform} posts yet",
+                              code="alt_text_unsupported", hint="Leave out --alt for this platform.")
+        if media and platform == "linkedin":
+            _check_linkedin_media(media, body, alt)
         sources = list(dict.fromkeys(source_urls or []))
         now = utc_text(utc_now())
         key = idempotency_key or None
@@ -280,7 +326,7 @@ class Outbox:
                                    f"--platform {platform} --account {account}")
         fields = (platform, account, canonical_key, action,
                   body, media, media_id, target_id, target_url, int(crosspost_threads),
-                  json.dumps(sources, ensure_ascii=False))
+                  json.dumps(sources, ensure_ascii=False), alt)
         self.db.execute("BEGIN IMMEDIATE")
         try:
             if key:
@@ -288,7 +334,8 @@ class Outbox:
                 if existing:
                     old = tuple(existing[name] for name in (
                         "platform", "account", "account_key", "action", "body", "media_path",
-                        "media_id", "target_id", "target_url", "crosspost_threads", "source_urls"))
+                        "media_id", "target_id", "target_url", "crosspost_threads", "source_urls",
+                        "media_alt"))
                     if old != fields:
                         raise OutboxError("idempotency key already belongs to different content",
                                           code="idempotency_conflict",
@@ -300,9 +347,9 @@ class Outbox:
             self.db.execute(
                 """INSERT INTO jobs
                    (id,idempotency_key,platform,account,account_key,action,body,media_path,
-                    media_id,target_id,target_url,crosspost_threads,source_urls,
+                    media_id,target_id,target_url,crosspost_threads,source_urls,media_alt,
                     status,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'draft',?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft',?,?)""",
                 (job_id, key, *fields, now, now),
             )
             self.db.execute("COMMIT")

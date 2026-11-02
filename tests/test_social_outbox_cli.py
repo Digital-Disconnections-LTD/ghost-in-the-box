@@ -7,8 +7,9 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from scripts import social_outbox
+from scripts import social_outbox, social_publish_job
 from _env import IsolatedStateTestCase
+from test_linkedin_adapter import png_bytes
 
 
 class OutboxCommandTests(IsolatedStateTestCase):
@@ -81,6 +82,68 @@ class OutboxCommandTests(IsolatedStateTestCase):
         code, result = self.cli("list", "--limit", "500")
         self.assertEqual(code, 2)
         self.assertEnvelope(result, "invalid_request")
+
+    def image_draft(self, *extra):
+        image = self.root / "photo.png"
+        image.write_bytes(png_bytes())
+        return image, self.cli("draft", "--platform", "linkedin", "--account", "mine",
+                               "--body-file", str(self.body), "--media", str(image), *extra)
+
+    def test_linkedin_draft_accepts_one_image_with_alt_text(self):
+        image, (code, draft) = self.image_draft("--alt", "A red square")
+        self.assertEqual(code, 0)
+        code, shown = self.cli("show", draft["result"]["id"])
+        self.assertEqual((shown["result"]["media_path"], shown["result"]["media_alt"]),
+                         (str(image.resolve()), "A red square"))
+
+    def test_linkedin_draft_refuses_a_second_image_and_a_fake_image(self):
+        image = self.root / "photo.png"
+        image.write_bytes(png_bytes())
+        code, result = self.cli("draft", "--platform", "linkedin", "--account", "mine",
+                                "--body-file", str(self.body), "--media", str(image), "--media", str(image))
+        self.assertEqual(code, 2)
+        self.assertEnvelope(result, "linkedin_single_image_only")
+        code, result = self.cli("draft", "--platform", "instagram", "--account", "mine",
+                                "--body-file", str(self.body), "--media", str(image), "--media", str(image))
+        self.assertEqual(code, 2)
+        self.assertEnvelope(result, "multiple_media")
+        fake = self.root / "photo.jpg"
+        fake.write_text("hello", encoding="utf-8")
+        code, result = self.cli("draft", "--platform", "linkedin", "--account", "mine",
+                                "--body-file", str(self.body), "--media", str(fake))
+        self.assertEqual(code, 2)
+        self.assertEnvelope(result, "invalid_media")
+        code, result = self.cli("draft", "--platform", "linkedin", "--account", "mine",
+                                "--body-file", str(self.body), "--alt", "no image")
+        self.assertEqual(code, 2)
+        self.assertEnvelope(result, "alt_requires_media")
+        code, result = self.cli("list", "--status", "all")
+        self.assertEqual(result["result"], [])
+
+    def test_publish_dry_run_summarises_the_linkedin_image_without_network(self):
+        image, (_, draft) = self.image_draft("--alt", "A red square")
+        job_id = draft["result"]["id"]
+        self.cli("queue", job_id)
+        output = io.StringIO()
+        with redirect_stdout(output), patch.object(social_publish_job, "LinkedInAdapter",
+                                                   side_effect=AssertionError("no adapter")):
+            code = social_publish_job.main(["--db", self.db, "--dry-run", job_id])
+        result = json.loads(output.getvalue())
+        self.assertEqual((code, result["status"], result["network_requests"]), (0, "dry_run", 0))
+        self.assertEqual(result["media"], {"path": str(image.resolve()), "mime": "image/png",
+                                           "size_bytes": len(png_bytes()), "alt_text": "A red square",
+                                           "valid": True})
+        self.assertEqual(result["payload"]["media_alt"], "A red square")
+        self.assertNotIn("media_invalid", result["blockers"])
+        image.write_text("replaced by text", encoding="utf-8")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            social_publish_job.main(["--db", self.db, "--dry-run", job_id])
+        result = json.loads(output.getvalue())
+        self.assertFalse(result["media"]["valid"])
+        self.assertIn("JPEG, PNG, GIF or WebP", result["media"]["problem"])
+        self.assertIn("media_invalid", result["blockers"])
+        self.assertIn("payload_changed", result["blockers"])
 
 
 if __name__ == "__main__":

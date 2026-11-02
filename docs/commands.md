@@ -6,8 +6,8 @@ or `ghost-in-the-box help COMMAND`. A typo gets a "did you mean" suggestion.
 Terms are explained in [plain terms](glossary.md).
 
 Commands print JSON results on stdout. `doctor` and `config` print text unless
-you add `--json`, `brief` prints a text receipt, and `instagram-mcp --list-tools
---format md` prints Markdown. Exit codes and the
+you add `--json`, `brief` prints a text receipt, and `mcp-tools --format md` (or
+a server's `--list-tools --format md`) prints Markdown. Exit codes and the
 error format are in [configuration](configuration.md#errors-and-exit-codes).
 
 `HANDLE` is a public account name without `@`. `JOB` is an outbox job ID.
@@ -46,7 +46,7 @@ error format are in [configuration](configuration.md#errors-and-exit-codes).
 | :--- | :--- |
 | `brief --json PACK [--out DIR] [--emit]` | Turn a topic pack into a cited brief. `--emit` also writes one `.body` file per lane and prints the draft commands. Output goes to `./out/briefs` under the current folder unless you pass `--out`. `brief --help` lists every topic-pack field; [examples/topic-pack.json](../examples/topic-pack.json) is a working sample. |
 | `brief --title T --lane L [--source LABEL=URL] [--why ...] [--draft LANE=TEXT] ...` | Build a brief from flags instead of a JSON file. |
-| `outbox draft --platform P --account HANDLE --body TEXT\|--body-file FILE [--action post\|reply] [--media F] [--target-id ID --target-url URL] [--source-url URL] [--idempotency-key K]` | Create a draft job. Sends nothing. `--body-file -` reads stdin. Platforms: `instagram`, `threads`, `linkedin`. Facebook, TikTok and YouTube are refused. |
+| `outbox draft --platform P --account HANDLE --body TEXT\|--body-file FILE [--action post\|reply] [--media F [--alt TEXT]] [--target-id ID --target-url URL] [--source-url URL] [--idempotency-key K]` | Create a draft job. Sends nothing. `--body-file -` reads stdin. Platforms: `instagram`, `threads`, `linkedin`. Facebook, TikTok and YouTube are refused. `--media` takes one file; a LinkedIn post takes one JPEG, PNG, GIF or WebP image of at most 8 MiB, checked by its bytes. `--alt` (LinkedIn only) stores alt text for that image. |
 | `outbox queue JOB [--at ISO-TIME]` | Freeze a draft's text and media and schedule it (default now). |
 | `outbox list [--status S] [--limit N]` | Show active jobs (draft, queued, in flight, uncertain). `--status all` shows every job. |
 | `outbox show JOB` | Show one job in full, including its text. |
@@ -59,7 +59,7 @@ error format are in [configuration](configuration.md#errors-and-exit-codes).
 | `outbox --db PATH ...` | Use another outbox file for one command (put `--db` before the subcommand). |
 | `publish JOB` | Send one queued job once it is due, then record its receipt. This is a real post. |
 | `publish JOB --now` | Send a queued job even if it is scheduled for later. |
-| `publish --dry-run JOB` | Show the frozen payload, target account and blockers. Sends nothing. |
+| `publish --dry-run JOB` | Show the frozen payload, target account and blockers. For a LinkedIn image it also shows the path, type, size and alt text. Sends nothing. |
 | `publish --due [--platform P] [--account HANDLE] [--limit N]` | Claim and send every due job (at most N, 1 to 50). This is what the timers run. |
 | `carousel draft --account HANDLE --body-file FILE --image IMG... [--crosspost-threads] [--source-url URL] [--idempotency-key K]` | Freeze 2 to 10 images into one Instagram carousel draft. |
 | `memes [--root DIR] collect [--count N] [--pages N] [--query Q]` | Add new images from public meme sources, run OCR and refresh topic folders. |
@@ -125,6 +125,8 @@ only read; posting goes through the outbox.
 | `linkedin --account HANDLE posts [--limit N] [--start N]` | Read your own posts. |
 | `linkedin --account HANDLE conversations [--limit N] [--start N]` | Read your conversation list. |
 | `linkedin --account HANDLE messages CONVERSATION_ID [--limit N] [--start N]` | Read messages in one conversation. |
+| `linkedin-mcp [--account HANDLE]` | Run the LinkedIn MCP server over stdio: the reads above plus outbox drafts, queueing, dry runs and exact-job publishing. Without `--account` it uses `SOCIAL_FARM_LINKEDIN_ACCOUNT` or the only registered LinkedIn account. See [MCP tools](mcp.md). |
+| `linkedin-mcp --list-tools [--format json\|md\|mcp]` | Print the LinkedIn tool catalog without an account or LinkedIn. |
 
 ## Substack and MCP
 
@@ -132,6 +134,7 @@ only read; posting goes through the outbox.
 | :--- | :--- |
 | `substack-mcp [--account HANDLE]` | Run the Substack MCP server. Needs the `substack` extra. |
 | `mcp-bridge -- COMMAND [ARGS...]` | Connect a Content-Length framed client (Batbox) to a newline-JSON server. |
+| `mcp-tools [--format json\|md\|mcp]` | Print every MCP server's tool catalog (Instagram, LinkedIn, Substack) offline. `docs/mcp.md` is generated from `--format md`. |
 
 ## Timer scripts
 
