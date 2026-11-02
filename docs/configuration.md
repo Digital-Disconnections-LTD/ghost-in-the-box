@@ -87,6 +87,7 @@ Every setting is optional.
 | `SOCIAL_FARM_LOGIN_BROWSER` | The browser the login wizard opens: `auto`, `chrome`, `msedge`, `brave` or `chromium`. `login start --browser` wins over it. | `auto` (Chrome, Edge, Brave, Chromium, then Playwright Chromium) | `login` |
 | `SOCIAL_FARM_IG_ACCOUNT` | Default account for the Instagram MCP server. | none | `instagram-mcp` |
 | `SOCIAL_FARM_IG_PYTHON` | The Python interpreter that has instagrapi installed. | the running Python | `instagram-mcp`, `publish` |
+| `SOCIAL_FARM_LINKEDIN_ACCOUNT` | Default account for the LinkedIn MCP server. | none | `linkedin-mcp` |
 | `SOCIAL_FARM_VISION_URL` | An OpenAI-compatible vision endpoint. | `http://127.0.0.1:8001/v1/chat/completions` | `vision`, the `instagram_inspect_slide` tool |
 | `SOCIAL_FARM_VISION_MODEL` | The vision model name. | `your-vision-model` | `vision`, the `instagram_inspect_slide` tool |
 | `SOCIAL_FARM_CHAT_PATH` | A script that delivers Threads notification batches (see below). | none | `threads-notifications` |

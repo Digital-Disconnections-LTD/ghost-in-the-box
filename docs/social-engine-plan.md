@@ -40,8 +40,9 @@ deployment's current connectivity.
    formats already exist; their publishers do not. Verify and extend the
    experimental LinkedIn adapter against real provider accounts.
 4. **Better context for agents.** Improve source-linked voice corpora, reply
-   context, and the handoff to Batbox or another coordinator. Threads and
-   LinkedIn are CLI-only today; MCP tools for them would help agents.
+   context, and the handoff to Batbox or another coordinator. Threads is
+   CLI-only today; MCP tools for it would help agents, as `linkedin-mcp` does
+   for LinkedIn.
 5. **More real platform acceptance.** Test fresh installations, optional browser
    dependencies, account setup, and provider changes on supported systems.
 

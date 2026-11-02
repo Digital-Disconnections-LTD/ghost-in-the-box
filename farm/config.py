@@ -195,6 +195,7 @@ ENVIRONMENT = (
     ("SOCIAL_FARM_IG_ACCOUNT", "Default account for the Instagram MCP server", "none", "instagram-mcp"),
     ("SOCIAL_FARM_IG_PYTHON", "Python interpreter with instagrapi installed", "the running Python",
      "instagram-mcp, publish"),
+    ("SOCIAL_FARM_LINKEDIN_ACCOUNT", "Default account for the LinkedIn MCP server", "none", "linkedin-mcp"),
     ("SOCIAL_FARM_VISION_URL", "OpenAI-compatible vision endpoint",
      "http://127.0.0.1:8001/v1/chat/completions", "vision"),
     ("SOCIAL_FARM_VISION_MODEL", "Vision model name", "your-vision-model", "vision"),

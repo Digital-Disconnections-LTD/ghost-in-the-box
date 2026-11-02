@@ -5,6 +5,11 @@
       "command": "/absolute/path/to/ghost-in-the-box/.venv/bin/ghost-in-the-box",
       "args": ["instagram-mcp", "--account", "YOUR_HANDLE"]
     },
+    "ghost-in-the-box-linkedin": {
+      "type": "stdio",
+      "command": "/absolute/path/to/ghost-in-the-box/.venv/bin/ghost-in-the-box",
+      "args": ["linkedin-mcp", "--account", "YOUR_HANDLE"]
+    },
     "ghost-in-the-box-substack": {
       "type": "stdio",
       "command": "/absolute/path/to/ghost-in-the-box/.venv/bin/ghost-in-the-box",

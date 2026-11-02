@@ -1,0 +1,17 @@
+# Codex CLI. Merge these tables into ~/.codex/config.toml, replace the path and
+# the handles, and drop any server you do not use. Check with: codex mcp list
+#
+# To keep state somewhere else, add a line under a table:
+#   env = { SOCIAL_FARM_STATE_DIR = "/absolute/private/dir" }
+
+[mcp_servers.ghost-in-the-box-instagram]
+command = "/absolute/path/to/ghost-in-the-box/.venv/bin/ghost-in-the-box"
+args = ["instagram-mcp", "--account", "YOUR_HANDLE"]
+
+[mcp_servers.ghost-in-the-box-linkedin]
+command = "/absolute/path/to/ghost-in-the-box/.venv/bin/ghost-in-the-box"
+args = ["linkedin-mcp", "--account", "YOUR_HANDLE"]
+
+[mcp_servers.ghost-in-the-box-substack]
+command = "/absolute/path/to/ghost-in-the-box/.venv/bin/ghost-in-the-box"
+args = ["substack-mcp", "--account", "YOUR_SUBSTACK_HANDLE"]

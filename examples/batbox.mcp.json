@@ -4,6 +4,10 @@
       "command": "/absolute/path/to/ghost-in-the-box/.venv/bin/ghost-in-the-box",
       "args": ["instagram-mcp", "--account", "YOUR_HANDLE"]
     },
+    "ghost-in-the-box-linkedin": {
+      "command": "/absolute/path/to/ghost-in-the-box/.venv/bin/ghost-in-the-box",
+      "args": ["linkedin-mcp", "--account", "YOUR_HANDLE"]
+    },
     "ghost-in-the-box-substack": {
       "command": "/absolute/path/to/ghost-in-the-box/.venv/bin/ghost-in-the-box",
       "args": ["mcp-bridge", "--", "/absolute/path/to/ghost-in-the-box/.venv/bin/ghost-in-the-box", "substack-mcp"],

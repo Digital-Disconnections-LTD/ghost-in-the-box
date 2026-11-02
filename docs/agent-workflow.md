@@ -45,8 +45,9 @@ Cancel a draft or queued job you no longer want with `outbox cancel JOB_ID`.
 
 ## Bring your own coordinator
 
-The CLI and [MCP tools](mcp.md) work with Batbox, Claude Desktop, Claude Code
-and other clients. Threads and LinkedIn are reachable through the CLI only.
+The CLI and [MCP tools](mcp.md) work with Batbox, Claude Desktop, Claude Code,
+Codex CLI and other clients. Instagram and LinkedIn have MCP servers; Threads is
+reachable through the CLI only.
 Account authentication, social provider permissions, and an agent harness's
 permission mode are separate concerns. Ghost in the Box commands do not wait for
 approval dialogs; they return results or clear setup/authentication errors in

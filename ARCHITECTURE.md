@@ -90,8 +90,14 @@ Entry points:
   `threads` command. `scripts/social_publish_job.py` is `publish`.
   `scripts/ig_publish_once.py` and `scripts/threads_publish_once.py` are thin
   timer wrappers around `publish --due`; the Threads one adds cadence.
+- `farm/mcp_server.py` holds what the MCP servers share: the stdio transport
+  (newline JSON and Content-Length frames), protocol negotiation, input
+  schemas, account selection, the error envelope and the tool catalogs.
 - `farm/instagram_mcp.py` exposes bounded Instagram and local media tools over
   MCP stdio.
+- `farm/linkedin_mcp.py` exposes LinkedIn reads and outbox steps over MCP stdio.
+  `linkedin_publish_job` and `linkedin_dry_run` call `scripts/social_publish_job.py`,
+  so the MCP server has no sender of its own.
 - `scripts/mcp_stdio_bridge.py` adapts Content-Length framing to newline JSON
   without changing tool payloads.
 - `buzz/buzz_brief.py` creates cited, dated briefs and draft body files. Formatting

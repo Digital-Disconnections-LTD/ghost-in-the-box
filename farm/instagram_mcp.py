@@ -1,26 +1,23 @@
 """Instagram tools backed by the saved session, inbox and durable outbox.
 
-The transport lives here too: standard MCP stdio (newline-delimited JSON), plus
-Content-Length frames for framed clients such as Batbox, answered in kind.
-No provider objects, credentials, session files or raw provider errors cross it.
+The stdio transport, protocol negotiation and catalog helpers are shared with the
+other servers in farm.mcp_server. No provider objects, credentials, session files
+or raw provider errors cross it.
 """
 
 from __future__ import annotations
 
 import ast
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stdout
 from datetime import datetime
 import io
 import json
-import os
 from pathlib import Path
 import re
-import sys
 import uuid
 
 from farm import config
 from farm.accounts import AccountRegistry
-from farm.cli_output import error_object
 from farm.adapters.instagram import InstagramAdapter
 from farm.inbox import Inbox, sync_comments
 from farm.instagram_session import InstagramSessionError, read_with_session
@@ -31,16 +28,26 @@ from farm.outbox import JOB_STATES as OUTBOX_JOB_STATES, Outbox, utc_text, utc_n
 from scripts.instagram_carousel import ROOT as CAROUSEL_ROOT, create_draft as carousel_draft
 from scripts import meme_library
 from scripts.social_publish_job import run as publish_exact_job
+from farm import mcp_server
+from farm.mcp_server import ToolInputError, boolean, choice, integer, string
 
 
 MEME_ROOT = meme_library.ROOT
+# The protocol and transport live in farm.mcp_server; these names stay importable from here.
+SUPPORTED_PROTOCOL_VERSIONS = mcp_server.SUPPORTED_PROTOCOL_VERSIONS
+LATEST_PROTOCOL_VERSION = mcp_server.LATEST_PROTOCOL_VERSION
+BATCH_PROTOCOL_VERSIONS = mcp_server.BATCH_PROTOCOL_VERSIONS
+MAX_MESSAGE_BYTES = mcp_server.MAX_MESSAGE_BYTES
+AccountSelectionError = mcp_server.AccountSelectionError
+negotiate_protocol = mcp_server.negotiate_protocol
+server_version = mcp_server.server_version
+validate = mcp_server.validate
+read_message = mcp_server.read_message
+write_message = mcp_server.write_message
+catalog_markdown = mcp_server.catalog_markdown
+
 SERVER_NAME = "ghost-in-the-box-instagram"
 SERVER_TITLE = "Ghost in the Box: Instagram"
-# Newest first. Batching is only part of 2025-03-26, so it is accepted only there.
-SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
-LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0]
-BATCH_PROTOCOL_VERSIONS = frozenset({"2025-03-26"})
-MAX_MESSAGE_BYTES = 1024 * 1024
 JOB_STATES = list(OUTBOX_JOB_STATES)
 ACCOUNT_PATTERN = r"[A-Za-z0-9_.]{1,30}"
 # Handles that appear in docs and examples; they are refused unless really registered.
@@ -55,93 +62,19 @@ def login_hint(account):
 INSTALL_HINT = "install the Instagram extra: " + config.install_command("instagram")
 
 
-class ToolInputError(ValueError):
-    """An explicitly safe local validation message with a stable code and next step."""
-
-    def __init__(self, message, *, code="invalid_input", hint=None):
-        super().__init__(message)
-        self.code = code
-        self.hint = hint
-
-
-class AccountSelectionError(Exception):
-    """Why the server cannot pick an Instagram account, and what to run instead."""
-
-    def __init__(self, message, hint):
-        super().__init__(message)
-        self.hint = hint
-
-
 def is_placeholder(account):
     return account.casefold() in PLACEHOLDER_ACCOUNTS
 
 
 def resolve_account(explicit=None, *, environ=None, registry_factory=AccountRegistry):
     """Pick the configured account: --account, SOCIAL_FARM_IG_ACCOUNT, else the only registered one."""
-    environ = os.environ if environ is None else environ
-    candidate = (explicit or environ.get("SOCIAL_FARM_IG_ACCOUNT") or "").strip()
-    if candidate and not re.fullmatch(ACCOUNT_PATTERN, candidate):
-        raise AccountSelectionError(
-            "--account must be an Instagram handle: 1-30 letters, digits, '.' or '_'",
-            "pass the handle without '@', for example --account my_handle")
-    try:
-        registry = registry_factory()
-        if candidate:
-            if is_placeholder(candidate) and registry.get("instagram", candidate) is None:
-                raise AccountSelectionError(
-                    f"'{candidate}' is the documentation placeholder, not a registered Instagram account",
-                    "pass your own handle with --account; to register it, " + login_hint("YOUR_HANDLE"))
-            return candidate
-        handles = sorted(entry["account"] for entry in registry.list() if entry["platform"] == "instagram")
-    except AccountSelectionError:
-        raise
-    except (OSError, ValueError) as error:
-        raise AccountSelectionError(
-            f"the account registry could not be read ({type(error).__name__})",
-            "run ghost-in-the-box doctor and ghost-in-the-box accounts list, or pass --account HANDLE") from None
-    if len(handles) == 1:
-        return handles[0]
-    if not handles:
-        raise AccountSelectionError("no Instagram account is registered and --account was not given",
-                                    login_hint("YOUR_HANDLE") + ", or pass --account HANDLE")
-    raise AccountSelectionError(
-        f"{len(handles)} Instagram accounts are registered ({', '.join(handles)}); choose one",
-        "pass --account HANDLE (or set SOCIAL_FARM_IG_ACCOUNT)")
-
-
-def negotiate_protocol(requested):
-    """Echo a supported client version; otherwise offer our newest one."""
-    return requested if requested in SUPPORTED_PROTOCOL_VERSIONS else LATEST_PROTOCOL_VERSION
-
-
-def server_version():
-    return config.package_version()
-
-
-def string(description, *, minimum=1, maximum=4096, pattern=None, default=None):
-    result = {"type": "string", "description": description,
-              "minLength": minimum, "maxLength": maximum}
-    if pattern:
-        result["pattern"] = pattern
-    if default is not None:
-        result["default"] = default
-    return result
-
-
-def integer(description, default, low, high):
-    return {"type": "integer", "description": description, "default": default,
-            "minimum": low, "maximum": high}
-
-
-def boolean(description, default=False):
-    return {"type": "boolean", "description": description, "default": default}
-
-
-def choice(description, values, default=None):
-    result = {"type": "string", "description": description, "enum": values}
-    if default is not None:
-        result["default"] = default
-    return result
+    return mcp_server.select_account(
+        explicit, platform="instagram", label="Instagram", env_var="SOCIAL_FARM_IG_ACCOUNT",
+        environ=environ, registry_factory=registry_factory,
+        valid_handle=lambda handle: re.fullmatch(ACCOUNT_PATTERN, handle) is not None,
+        invalid_message="--account must be an Instagram handle: 1-30 letters, digits, '.' or '_'",
+        invalid_hint="pass the handle without '@', for example --account my_handle",
+        placeholders=PLACEHOLDER_ACCOUNTS, login_hint=login_hint)
 
 
 JOB_ID = string("Exact Instagram outbox job ID.", maximum=100)
@@ -157,12 +90,8 @@ CURSOR = string("Opaque cursor from the previous page; omit for the first page."
 
 def tool(name, title, description, properties=None, required=(), *, read_only=False, external=False,
          destructive=False):
-    # title is the 2025-06-18 field; annotations.title serves 2025-03-26 clients.
-    return {"name": f"instagram_{name}", "title": title, "description": description,
-            "inputSchema": {"type": "object", "properties": properties or {},
-                            "required": list(required), "additionalProperties": False},
-            "annotations": {"title": title, "readOnlyHint": read_only, "destructiveHint": destructive,
-                            "openWorldHint": external}}
+    return mcp_server.make_tool("instagram", name, title, description, properties, required,
+                                read_only=read_only, external=external, destructive=destructive)
 
 
 TOOLS = [
@@ -313,42 +242,6 @@ TOOLS = [
 TOOL_BY_NAME = {item["name"]: item for item in TOOLS}
 
 
-def validate(value, schema, field="arguments"):
-    """Validate the small JSON Schema subset advertised above before side effects."""
-    kind = schema.get("type")
-    valid = {"object": isinstance(value, dict), "string": isinstance(value, str),
-             "array": isinstance(value, list), "integer": type(value) is int,
-             "boolean": type(value) is bool}.get(kind, False)
-    if not valid:
-        raise ToolInputError(f"{field} must be {kind}")
-    if "enum" in schema and value not in schema["enum"]:
-        raise ToolInputError(f"{field} has an unsupported value")
-    if kind == "object":
-        properties = schema["properties"]
-        if any(key not in properties for key in value):
-            raise ToolInputError("arguments contains an unknown field")
-        for required in schema.get("required", []):
-            if required not in value:
-                raise ToolInputError(f"{required} is required")
-        for key, item in value.items():
-            validate(item, properties[key], key)
-    elif kind == "string":
-        if not schema.get("minLength", 0) <= len(value) <= schema.get("maxLength", MAX_MESSAGE_BYTES):
-            raise ToolInputError(f"{field} has an invalid length")
-        if schema.get("minLength", 0) and not value.strip():
-            raise ToolInputError(f"{field} must not be blank")
-        if schema.get("pattern") and not re.fullmatch(schema["pattern"], value):
-            raise ToolInputError(f"{field} has an invalid format")
-    elif kind == "integer":
-        if not schema["minimum"] <= value <= schema["maximum"]:
-            raise ToolInputError(f"{field} is outside its allowed bounds")
-    elif kind == "array":
-        if not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", 100):
-            raise ToolInputError(f"{field} has an invalid number of items")
-        for item in value:
-            validate(item, schema["items"], field)
-
-
 RETRY_PAGE_HINT = "nothing was saved and no cursor advanced; call again later with the same arguments"
 RECEIPT_HINT = ("the job stays uncertain; confirm the provider_id on the account's own post or reply, "
                 "then call instagram_reconcile_job again")
@@ -453,14 +346,7 @@ class InstagramTools:
             raise ToolInputError("unknown Instagram tool", code="unknown_tool",
                                  hint="call tools/list for the available names")
         self.require_real_account()
-        schema = TOOL_BY_NAME[name]["inputSchema"]
-        try:
-            validate(arguments, schema)
-        except ToolInputError as error:
-            raise ToolInputError(str(error), code="invalid_arguments",
-                                 hint=f"match the inputSchema of {name} from tools/list") from None
-        args = {key: prop["default"] for key, prop in schema["properties"].items() if "default" in prop}
-        args.update(arguments)
+        args = mcp_server.prepare_call(TOOL_BY_NAME, name, arguments, unknown="unknown Instagram tool")
         return getattr(self, name.removeprefix("instagram_"))(**args)
 
     def require_real_account(self):
@@ -853,7 +739,7 @@ LOCAL_DETAIL_TOOLS = frozenset(item["name"] for item in TOOLS
 
 
 def tool_error(code, message, hint):
-    return error_object(code, message, hint, fallback_hint=INTERNAL_HINT)
+    return mcp_server.tool_error(code, message, hint, fallback_hint=INTERNAL_HINT)
 
 
 def _session_failure(account, status):
@@ -899,8 +785,7 @@ def _structured_failure(result, account):
 def _tool_result(service, name, arguments):
     try:
         # Third-party diagnostics must never corrupt framing or expose secrets.
-        with open(os.devnull, "w") as quiet, redirect_stdout(quiet), redirect_stderr(quiet):
-            result = service.call(name, arguments)
+        result = mcp_server.quiet_call(service.call, name, arguments)
         if not isinstance(result, dict):
             raise TypeError("tool returned a non-object result")
         result = _structured_failure(result, service.account)
@@ -928,8 +813,7 @@ def _tool_result(service, name, arguments):
         result = {"ok": False, "error": tool_error(
             "internal_error", "the tool failed; details are withheld so session data and provider responses "
             "cannot leak", INTERNAL_HINT), "error_type": type(error).__name__}
-    return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
-            "isError": not result.get("ok", False)}
+    return mcp_server.tool_content(result)
 
 
 INSTRUCTIONS = ("Instagram uses the configured saved session and durable outbox. "
@@ -941,82 +825,26 @@ INSTRUCTIONS = ("Instagram uses the configured saved session and durable outbox.
     "Failed calls return error.code, error.message and error.hint; follow the hint.")
 
 
-def _invalid(request_id=None, message="Invalid request"):
-    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32600, "message": message}}
+SERVER = mcp_server.Server(name=SERVER_NAME, title=SERVER_TITLE, instructions=INSTRUCTIONS, tools=TOOLS,
+                           call=_tool_result, unknown_tool="Unknown Instagram tool")
 
 
 def dispatch(service, message, session=None):
     """Answer one JSON-RPC message; session remembers the negotiated protocol version."""
-    if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
-        return _invalid()
-    if "id" not in message:
-        return None  # Notifications never execute tools and never receive replies.
-    request_id = message["id"]
-    method = message.get("method")
-    params = message.get("params", {})
-    response = {"jsonrpc": "2.0", "id": request_id}
-    if not isinstance(params, dict) or not isinstance(method, str):
-        return _invalid(request_id)
-    elif method == "initialize":
-        version = negotiate_protocol(params.get("protocolVersion"))
-        if session is not None:
-            session["protocol"] = version
-        response["result"] = {"protocolVersion": version, "capabilities": {"tools": {}},
-            "serverInfo": {"name": SERVER_NAME, "title": SERVER_TITLE, "version": server_version()},
-            "instructions": INSTRUCTIONS}
-    elif method == "ping":
-        response["result"] = {}
-    elif method == "tools/list":
-        response["result"] = {"tools": TOOLS}
-    elif method == "tools/call":
-        name, arguments = params.get("name"), params.get("arguments", {})
-        if not isinstance(name, str) or name not in TOOL_BY_NAME:
-            response["error"] = {"code": -32602, "message": "Unknown Instagram tool"}
-        else:
-            response["result"] = _tool_result(service, name, arguments)
-    elif method in ("resources/list", "resources/templates/list", "prompts/list"):
-        key = {"resources/list": "resources", "resources/templates/list": "resourceTemplates", "prompts/list": "prompts"}[method]
-        response["result"] = {key: []}
-    else:
-        response["error"] = {"code": -32601, "message": "Method not found"}
-    return response
+    return SERVER.dispatch(service, message, session)
 
 
 def handle(service, message, session):
     """Answer one message, or a JSON-RPC batch when 2025-03-26 was negotiated."""
-    if not isinstance(message, list):
-        return dispatch(service, message, session)
-    if session.get("protocol") not in BATCH_PROTOCOL_VERSIONS or not message:
-        return _invalid()
-    replies = []
-    for item in message:
-        if isinstance(item, dict) and item.get("method") == "initialize":
-            reply = _invalid(item.get("id"), "initialize cannot be batched") if "id" in item else None
-        else:
-            reply = dispatch(service, item, session)
-        if reply is not None:
-            replies.append(reply)
-    return replies or None
+    return SERVER.handle(service, message, session)
 
 
-def _first_sentence(text):
-    match = re.match(r"(.+?[.!?])(?:\s|$)", " ".join(text.split()))
-    return match.group(1) if match else " ".join(text.split())
+_first_sentence = mcp_server.first_sentence
 
 
 def tool_catalog(tools=None):
     """One-line summaries of the Instagram tools, for docs and quick inspection."""
-    entries = []
-    for item in TOOLS if tools is None else tools:
-        schema = item["inputSchema"]
-        required = list(schema.get("required", []))
-        entries.append({"name": item["name"], "title": item["title"],
-                        "description": _first_sentence(item["description"]),
-                        "required": required,
-                        "optional": [key for key in schema["properties"] if key not in required],
-                        "read_only": item["annotations"]["readOnlyHint"],
-                        "contacts_provider": item["annotations"]["openWorldHint"]})
-    return entries
+    return mcp_server.tool_catalog(TOOLS if tools is None else tools)
 
 
 def substack_catalog(path=SUBSTACK_SERVER_SCRIPT):
@@ -1054,104 +882,8 @@ def catalog(substack_path=SUBSTACK_SERVER_SCRIPT):
                         "note": "Needs the substack extra. Also exposes the upstream python-substack tools, "
                                 "which your MCP client lists after connecting.",
                         "tools": substack})
-    return {"generated_by": "ghost-in-the-box instagram-mcp --list-tools", "version": server_version(),
-            "protocol_versions": list(SUPPORTED_PROTOCOL_VERSIONS), "servers": servers}
-
-
-def _cell(value):
-    return " ".join(str(value).split()).replace("|", "\\|")
-
-
-def _access(entry):
-    if entry["read_only"] is None:
-        return ""
-    if entry["read_only"]:
-        return "reads the provider" if entry["contacts_provider"] else "local read"
-    return "writes; contacts the provider" if entry["contacts_provider"] else "local write"
-
-
-def catalog_markdown(data):
-    lines = ["# MCP tool catalog", "",
-             f"Generated by `ghost-in-the-box instagram-mcp --list-tools --format md` from Ghost in the Box "
-             f"{data['version']}. Supported MCP protocol versions: {', '.join(data['protocol_versions'])}.", ""]
-    for server in data["servers"]:
-        lines += [f"## {server['server']}", "", f"Start: `{server['command']}`", ""]
-        if server.get("note"):
-            lines += [server["note"], ""]
-        lines += ["| Tool | Title | What it does | Required | Optional | Access |",
-                  "|---|---|---|---|---|---|"]
-        for entry in server["tools"]:
-            lines.append("| " + " | ".join([
-                f"`{entry['name']}`", _cell(entry["title"]), _cell(entry["description"]),
-                ", ".join(f"`{name}`" for name in entry["required"]),
-                ", ".join(f"`{name}`" for name in entry["optional"]), _access(entry)]) + " |")
-        lines.append("")
-    return "\n".join(lines).rstrip("\n")
-
-
-def read_message(stream):
-    """Accept MCP newline JSON and Content-Length frames; respond in the caller's format."""
-    line = stream.readline(8193)
-    while line and not line.strip():
-        line = stream.readline(8193)
-    if not line:
-        return None, "framed"
-    if line.lstrip().startswith((b"{", b"[")):
-        if not line.endswith(b"\n"):
-            tail = stream.readline(MAX_MESSAGE_BYTES - len(line) + 1)
-            line += tail
-        if len(line) > MAX_MESSAGE_BYTES:
-            raise ValueError("message too large")
-        return json.loads(line), "lines"
-    total = len(line)
-    length = None
-    while line not in (b"\r\n", b"\n"):
-        if not line or total > 8192:
-            raise ValueError("invalid frame headers")
-        key, separator, value = line.partition(b":")
-        if not separator:
-            raise ValueError("invalid frame header")
-        if key.strip().lower() == b"content-length":
-            if length is not None:
-                raise ValueError("duplicate length")
-            length = int(value.strip())
-        line = stream.readline(8193)
-        total += len(line)
-    if length is None or not 0 < length <= MAX_MESSAGE_BYTES:
-        raise ValueError("invalid frame length")
-    chunks = bytearray()
-    while len(chunks) < length:
-        data = stream.read(length - len(chunks))
-        if not data:
-            raise ValueError("incomplete frame")
-        chunks.extend(data)
-    return json.loads(chunks), "framed"
-
-
-def write_message(stream, message, framing="framed"):
-    body = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    stream.write((f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
-                 if framing == "framed" else body + b"\n")
-    stream.flush()
+    return mcp_server.catalog_document("ghost-in-the-box instagram-mcp --list-tools", servers)
 
 
 def serve(service, stdin=None, stdout=None):
-    stdin = stdin or sys.stdin.buffer
-    stdout = stdout or sys.stdout.buffer
-    session = {}
-    framing = "framed"
-    while True:
-        try:
-            message, framing = read_message(stdin)
-        except (ValueError, UnicodeError):
-            # Invalid framing cannot safely be resynchronized. No raw payloads.
-            write_message(stdout, {"jsonrpc": "2.0", "id": None,
-                "error": {"code": -32700, "message": "Invalid JSON-RPC message"}}, framing)
-            return 2
-        if message is None:
-            return 0
-        if isinstance(message, dict) and message.get("method") == "notifications/exit" and "id" not in message:
-            return 0
-        response = handle(service, message, session)
-        if response is not None:
-            write_message(stdout, response, framing)
+    return SERVER.serve(service, stdin, stdout)

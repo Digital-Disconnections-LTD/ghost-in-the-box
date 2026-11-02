@@ -23,6 +23,7 @@ from farm.config import STATE_ROOT
 COMMANDS = {
     "login": ("scripts.social_login", "Choose logins and export/import portable account sessions"),
     "linkedin": ("scripts.linkedin", "Verify LinkedIn identity and read profiles, posts, and messages"),
+    "linkedin-mcp": ("scripts.linkedin_mcp", "Run LinkedIn tools over MCP stdio"),
     "accounts": ("scripts.social_accounts", "Register and inspect your account sessions"),
     "outbox": ("scripts.social_outbox", "Draft, queue, inspect, and reconcile deliveries"),
     "publish": ("scripts.social_publish_job", "Publish one exact job (--dry-run previews it) or due jobs (--due)"),
@@ -39,6 +40,7 @@ COMMANDS = {
     "vision": ("scripts.vision_inspect", "Inspect one image with your configured vision model"),
     "substack-mcp": ("scripts.substack_mcp_server", "Run the optional Substack MCP connector"),
     "mcp-bridge": ("scripts.mcp_stdio_bridge", "Connect framed MCP clients to JSONL servers"),
+    "mcp-tools": ("scripts.mcp_tools", "Print every MCP server's tool catalog (json, md or mcp)"),
 }
 BUILTINS = {
     "doctor": "Check this machine's setup and say exactly what to fix",
@@ -49,8 +51,8 @@ GROUPS = (
     ("Write and publish", ("brief", "outbox", "publish", "carousel", "memes", "vision")),
     ("Instagram", ("instagram-login", "instagram-import", "instagram-inbox", "instagram-mcp")),
     ("Threads", ("threads", "threads-setup", "threads-notifications")),
-    ("LinkedIn", ("linkedin",)),
-    ("Substack and MCP", ("substack-mcp", "mcp-bridge")),
+    ("LinkedIn", ("linkedin", "linkedin-mcp")),
+    ("Substack and MCP", ("substack-mcp", "mcp-bridge", "mcp-tools")),
 )
 
 # One table for optional extras, so doctor and the command gates can never disagree.
